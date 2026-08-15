@@ -5,6 +5,7 @@ import { getSettings } from '../db/settings';
 import { hashPassword, hashAccessKey, randomHex } from '../utils/crypto';
 import { normalizeMac } from '../utils/mac';
 import { clearFailure } from '../proxy/failureCache';
+import { healthCheckBatch, listOfflineChannels, healthStats, DEFAULT_HEALTH_BATCH } from '../playlist/health';
 import { jsonResponse, errorResponse, methodNotAllowed, logEvent } from '../utils/http';
 import { ErrorCodes } from '../errors/codes';
 
@@ -52,14 +53,16 @@ export async function handleAdmin(req: Request, env: Env, requestId: string, sub
         'playlist_hash',
         'playlist_source',
       ]);
-      const [users, keys, devices] = await Promise.all([
+      const [users, keys, devices, health] = await Promise.all([
         db.prepare('SELECT COUNT(*) AS n FROM users').first<{ n: number }>(),
         db.prepare('SELECT COUNT(*) AS n FROM access_keys').first<{ n: number }>(),
         db.prepare('SELECT COUNT(*) AS n FROM devices').first<{ n: number }>(),
+        healthStats(db),
       ]);
       return jsonResponse({
         service: 'CHRTV',
         playlist: settings,
+        health,
         stats: { users: users?.n ?? 0, access_keys: keys?.n ?? 0, devices: devices?.n ?? 0 },
       });
     }
@@ -68,8 +71,12 @@ export async function handleAdmin(req: Request, env: Env, requestId: string, sub
     if (subPath === 'channels' && method === 'GET') {
       const { results } = await db
         .prepare(
-          `SELECT c.id, c.xtream_id, c.name, c.tvg_id, c.tvg_logo, c.position, c.active, cat.name AS category
-           FROM channels c LEFT JOIN categories cat ON cat.id = c.category_id ORDER BY c.position ASC LIMIT 5000`,
+          `SELECT c.id, c.xtream_id, c.name, c.tvg_id, c.tvg_logo, c.position, c.active, cat.name AS category,
+                  h.status AS health_status, h.error_code, h.http_status, h.checked_at AS last_checked
+             FROM channels c
+             LEFT JOIN categories cat ON cat.id = c.category_id
+             LEFT JOIN channel_health h ON h.channel_id = c.id
+            ORDER BY c.position ASC LIMIT 5000`,
         )
         .all();
       return jsonResponse(results);
@@ -107,6 +114,22 @@ export async function handleAdmin(req: Request, env: Env, requestId: string, sub
       await clearFailure(channelId);
       await db.prepare('DELETE FROM stream_failures WHERE channel_id = ?').bind(channelId).run();
       return jsonResponse({ ok: true });
+    }
+
+    // ---- channel health (proactive offline detection) ----
+    if (subPath === 'offline' && method === 'GET') {
+      const offline = await listOfflineChannels(db, 1000);
+      return jsonResponse({ count: offline.length, channels: offline });
+    }
+    if (subPath === 'health-check') {
+      if (method !== 'POST') return methodNotAllowed(['POST'], requestId);
+      // On demand an operator may sweep more channels at once (?limit=); the
+      // module caps it at MAX_PROBES_PER_RUN. Default uses the same batch as cron.
+      const requested = Number(new URL(req.url).searchParams.get('limit'));
+      const limit = Number.isFinite(requested) && requested > 0 ? requested : DEFAULT_HEALTH_BATCH;
+      const summary = await healthCheckBatch(env, limit);
+      logEvent(requestId, '/api/admin/health-check', 'HEALTH_CHECK', JSON.stringify(summary));
+      return jsonResponse(summary);
     }
 
     // ---- users ----

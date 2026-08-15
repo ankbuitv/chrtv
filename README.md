@@ -42,6 +42,7 @@ GitHub M3U (playlists/tv.m3u)
 - **Token**: AES-256-GCM, chứa upstream URL + iat/exp, tamper-proof, tự hết hạn. Upstream URL không bao giờ lộ ra ngoài.
 - **SSRF guard**: chỉ http/https public; chặn localhost, private IP, link-local, metadata endpoints — kiểm tra cả từng hop redirect.
 - **Circuit breaker**: upstream fail → failure state TTL 30s trong Cloudflare Cache; trong TTL trả ngay fallback manifest, hết TTL tự retry.
+- **Channel health sweep**: cron `*/10 * * * *` chủ động probe batch kênh nhỏ (ưu tiên chưa check), đánh dấu `channel_health` online/offline/unknown → lộ ra qua `/api/admin/offline` + `health_status` ở `/api/admin/channels`. Bắt cả link "200 + HTML lỗi".
 - **Playlist sync an toàn**: playlist mới lỗi → giữ nguyên version cũ, đánh dấu sync failed. Hash không đổi → không ghi lại DB.
 
 ## Routes
@@ -65,13 +66,15 @@ GitHub M3U (playlists/tv.m3u)
 `Authorization: Bearer $ADMIN_TOKEN`
 
 ```
-GET    /api/admin/status            # system + playlist status, stats
-GET    /api/admin/channels          # danh sách channel
+GET    /api/admin/status            # system + playlist status, stats, channel health
+GET    /api/admin/channels          # danh sách channel (kèm health_status / last_checked)
 GET    /api/admin/categories
 POST   /api/admin/sync              # trigger sync (chống concurrent, 409 khi busy)
 GET    /api/admin/sync-logs
-GET    /api/admin/failures          # kênh lỗi gần đây
+GET    /api/admin/failures          # kênh lỗi gần đây (log phản ứng khi viewer bật)
 DELETE /api/admin/failures/{channelId}   # reset failure state
+GET    /api/admin/offline           # kênh đang bị đánh dấu offline (health sweep)
+POST   /api/admin/health-check[?limit=N] # chủ động probe một batch kênh ngay
 GET    /api/admin/users             # không bao giờ trả password hash
 POST   /api/admin/users             # {username, password, expires_at?}
 PATCH  /api/admin/users/{id}        # {status: active|disabled|expired|revoked}
@@ -84,6 +87,31 @@ GET    /api/admin/devices
 GET    /api/admin/devices/mac/{mac}
 PATCH  /api/admin/devices/{id}
 DELETE /api/admin/devices/{id}
+```
+
+### Phát hiện kênh offline (channel health)
+
+Circuit breaker ở proxy chỉ ghi lỗi khi **viewer thực sự bật** vào một kênh chết
+(`stream_failures`). Một kênh hỏng link mà chưa ai xem sẽ vẫn hiện "active" trong
+playlist mãi. CHRTV bổ sung một **health sweep chủ động**:
+
+- Cron `*/10 * * * *` probe một batch nhỏ (`HEALTH_CHECK_BATCH`, mặc định 20) kênh
+  active, ưu tiên kênh **chưa được check bao giờ / lâu nhất**, xoay vòng đều.
+- Mỗi probe fetch upstream (cùng luật SSRF + port-safe như proxy), follow redirect,
+  và **xác nhận body thật sự là HLS** — nên link "200 + HTML lỗi" cũng bị đánh
+  offline, không chỉ 4xx/5xx/timeout.
+- Kênh nằm port Worker không fetch được (vd `:30113`, player tự phát trực tiếp) →
+  đánh dấu `unknown`, **không** bị tính là offline.
+- Kết quả lưu vào bảng `channel_health` (state mới nhất mỗi kênh) và lộ ra qua
+  `GET /api/admin/offline`, `health_status` trong `/api/admin/channels`, và
+  `health` summary trong `/api/admin/status`.
+
+Chạy sweep ngay (vd để quét toàn bộ kênh lần đầu sau deploy):
+
+```bash
+# probe tới 100 kênh trong một lần (có hard cap)
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://YOUR_DOMAIN/api/admin/health-check?limit=100"
 ```
 
 ## Deploy
@@ -121,6 +149,8 @@ Cấu hình trong `wrangler.toml`:
   2. URL nằm trên port Worker **không** fetch được (ví dụ `:30113`) → CHRTV **302 redirect thẳng
      player** tới đó. Player trên thiết bị người dùng không bị giới hạn port nên vẫn phát bình thường.
   3. Không có URL nào dùng được → manifest "signal lost" rỗng mặc định.
+- `HEALTH_CHECK_BATCH` — (tuỳ chọn) số kênh probe mỗi cron health sweep (`*/10 * * * *`), mặc
+  định 20, hard cap 100. Càng lớn quét toàn bộ càng nhanh nhưng tốn thêm subrequest mỗi lần.
 
 ### ⚠️ Cổng (port) mà Cloudflare Workers fetch được
 
@@ -182,7 +212,7 @@ Password            : bất kỳ
 
 ```bash
 npm run dev        # wrangler dev (cần .dev.vars, xem .dev.vars.example)
-npm test           # 80 tests (unit + integration, chạy trong workerd)
+npm test           # 110 tests (unit + integration, chạy trong workerd)
 npm run typecheck
 npm run build      # wrangler deploy --dry-run
 ```

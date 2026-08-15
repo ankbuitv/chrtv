@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { SELF, env, fetchMock } from 'cloudflare:test';
 import { createToken } from '../src/token';
 import { syncPlaylist } from '../src/playlist/sync';
+import { probeChannel, healthCheckBatch } from '../src/playlist/health';
 import { handleHlsManifest } from '../src/proxy/handlers';
 import { hashPassword, randomHex } from '../src/utils/crypto';
 
@@ -759,5 +760,233 @@ describe('EPG', () => {
     expect(body).toContain('<?xml');
     expect(body).toContain('<tv');
     expect(body).toContain('</tv>');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Channel health checks (proactive offline detection).
+// These suites run last and reset the channel table to a known state because
+// healthCheckBatch selects across ALL active channels — leftovers from earlier
+// tests would otherwise change the counts and trigger unexpected fetches.
+// ---------------------------------------------------------------------------
+
+const HLS_OK = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\ns.ts\n#EXT-X-ENDLIST\n';
+
+async function resetChannels(): Promise<void> {
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM channel_health'),
+    env.DB.prepare('DELETE FROM channels'),
+    env.DB.prepare("INSERT OR IGNORE INTO categories (name, position) VALUES ('News', 0)"),
+  ]);
+}
+
+describe('channel health probe', () => {
+  it('classifies a live HLS upstream as online', async () => {
+    fetchMock
+      .get('https://hprobe.example.com')
+      .intercept({ path: '/ok.m3u8' })
+      .reply(200, HLS_OK, { headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } });
+    const r = await probeChannel('https://hprobe.example.com/ok.m3u8');
+    expect(r).toEqual({ status: 'online', errorCode: '', httpStatus: 200 });
+  });
+
+  it('flags a 404 upstream as offline', async () => {
+    fetchMock.get('https://hprobe.example.com').intercept({ path: '/404.m3u8' }).reply(404, 'x');
+    const r = await probeChannel('https://hprobe.example.com/404.m3u8');
+    expect(r).toMatchObject({ status: 'offline', errorCode: 'UPSTREAM_404', httpStatus: 404 });
+  });
+
+  it('flags a 200 + HTML body as offline (broken link hiding behind a 200)', async () => {
+    fetchMock.get('https://hprobe.example.com').intercept({ path: '/html.m3u8' }).reply(200, '<html><body>down</body></html>');
+    const r = await probeChannel('https://hprobe.example.com/html.m3u8');
+    expect(r).toMatchObject({ status: 'offline', errorCode: 'INVALID_HLS', httpStatus: 200 });
+  });
+
+  it('flags a 5xx upstream as offline', async () => {
+    fetchMock.get('https://hprobe.example.com').intercept({ path: '/500.m3u8' }).reply(500, 'boom');
+    const r = await probeChannel('https://hprobe.example.com/500.m3u8');
+    expect(r).toMatchObject({ status: 'offline', errorCode: 'UPSTREAM_5XX', httpStatus: 500 });
+  });
+
+  it('flags an unreachable upstream as offline (no interceptor => fetch throws)', async () => {
+    const r = await probeChannel('https://hprobe-unreachable.example.com/x.m3u8');
+    expect(r).toMatchObject({ status: 'offline', errorCode: 'UPSTREAM_UNREACHABLE' });
+  });
+
+  it('marks a channel on a Workers-unfetchable port as unknown (player streams it directly)', async () => {
+    const r = await probeChannel('http://hprobe.example.com:30113/x.m3u8');
+    expect(r).toMatchObject({ status: 'unknown', errorCode: 'UNSUPPORTED_PORT' });
+  });
+
+  it('marks an unsafe upstream as unknown without fetching', async () => {
+    const r = await probeChannel('http://169.254.169.254/latest/meta-data');
+    expect(r).toMatchObject({ status: 'unknown', errorCode: 'UNSAFE_URL' });
+  });
+
+  it('follows a redirect to a live manifest', async () => {
+    const origin = fetchMock.get('https://hprobe-redir.example.com');
+    origin.intercept({ path: '/go' }).reply(302, '', { headers: { Location: '/final/index.m3u8' } });
+    origin.intercept({ path: '/final/index.m3u8' }).reply(200, HLS_OK);
+    const r = await probeChannel('https://hprobe-redir.example.com/go');
+    expect(r).toMatchObject({ status: 'online', httpStatus: 200 });
+  });
+});
+
+describe('health-check sweep', () => {
+  async function seedSweepChannels(): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    await resetChannels();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+         VALUES ('cafebabe00000001', 200001, 'H-Online', 'https://hsweep.example.com/online.m3u8', '', '', 1, 0, 1, 9, ?, ?)`,
+      ).bind(now, now),
+      env.DB.prepare(
+        `INSERT INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+         VALUES ('cafebabe00000002', 200002, 'H-Dead', 'https://hsweep.example.com/dead.m3u8', '', '', 1, 1, 1, 9, ?, ?)`,
+      ).bind(now, now),
+      env.DB.prepare(
+        `INSERT INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+         VALUES ('cafebabe00000003', 200003, 'H-HTML', 'https://hsweep.example.com/html.m3u8', '', '', 1, 2, 1, 9, ?, ?)`,
+      ).bind(now, now),
+    ]);
+  }
+
+  it('probes a batch and records per-channel health', async () => {
+    await seedSweepChannels();
+    const origin = fetchMock.get('https://hsweep.example.com');
+    origin.intercept({ path: '/online.m3u8' }).reply(200, HLS_OK);
+    origin.intercept({ path: '/dead.m3u8' }).reply(404, 'x');
+    origin.intercept({ path: '/html.m3u8' }).reply(200, '<html>down</html>');
+
+    const summary = await healthCheckBatch(env, 10);
+    expect(summary).toEqual({ checked: 3, online: 1, offline: 2, unknown: 0 });
+
+    const rows = await env.DB
+      .prepare("SELECT channel_id, status, error_code FROM channel_health WHERE channel_id LIKE 'cafebabe%' ORDER BY channel_id")
+      .all<{ channel_id: string; status: string; error_code: string }>();
+    const byId = Object.fromEntries(rows.results.map((r) => [r.channel_id, r]));
+    expect(byId['cafebabe00000001']).toMatchObject({ status: 'online' });
+    expect(byId['cafebabe00000002']).toMatchObject({ status: 'offline', error_code: 'UPSTREAM_404' });
+    expect(byId['cafebabe00000003']).toMatchObject({ status: 'offline', error_code: 'INVALID_HLS' });
+  });
+
+  it('sweeps the oldest-checked channels first (never-checked beats recently checked)', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await resetChannels();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+         VALUES ('facade00000000a', 200011, 'Fresh', 'https://hsweep.example.com/fresh.m3u8', '', '', 1, 0, 1, 9, ?, ?)`,
+      ).bind(now, now),
+      env.DB.prepare(
+        `INSERT INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+         VALUES ('facade00000000b', 200012, 'Stale', 'https://hsweep.example.com/stale.m3u8', '', '', 1, 1, 1, 9, ?, ?)`,
+      ).bind(now, now),
+      // Stale was already checked recently; Fresh has never been checked.
+      env.DB.prepare(
+        "INSERT INTO channel_health (channel_id, status, error_code, http_status, checked_at) VALUES ('facade00000000b', 'online', '', 200, ?)",
+      ).bind(now),
+    ]);
+    // Only register an interceptor for Fresh — limit=1 must pick it (oldest = NULL).
+    fetchMock.get('https://hsweep.example.com').intercept({ path: '/fresh.m3u8' }).reply(200, HLS_OK);
+
+    const summary = await healthCheckBatch(env, 1);
+    expect(summary.checked).toBe(1);
+    const fresh = await env.DB
+      .prepare("SELECT checked_at FROM channel_health WHERE channel_id = 'facade00000000a'")
+      .first<{ checked_at: number }>();
+    expect(fresh?.checked_at).toBeGreaterThan(0);
+  });
+});
+
+describe('admin health visibility', () => {
+  async function seedHealthState(): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    await resetChannels();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+         VALUES ('deadbeef00000001', 300001, 'Offline One', 'https://x.example.com/a.m3u8', '', '', 1, 0, 1, 1, ?, ?)`,
+      ).bind(now, now),
+      env.DB.prepare(
+        `INSERT INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+         VALUES ('deadbeef00000002', 300002, 'Online One', 'https://x.example.com/b.m3u8', '', '', 1, 1, 1, 1, ?, ?)`,
+      ).bind(now, now),
+      env.DB.prepare(
+        'INSERT INTO channel_health (channel_id, status, error_code, http_status, checked_at) VALUES (?, ?, ?, ?, ?)',
+      )
+        .bind('deadbeef00000001', 'offline', 'UPSTREAM_404', 404, now),
+      env.DB.prepare(
+        'INSERT INTO channel_health (channel_id, status, error_code, http_status, checked_at) VALUES (?, ?, ?, ?, ?)',
+      )
+        .bind('deadbeef00000002', 'online', '', 200, now),
+    ]);
+  }
+
+  it('GET /api/admin/offline lists only the offline channels', async () => {
+    await seedHealthState();
+    const res = await SELF.fetch(`${BASE}/api/admin/offline`, { headers: ADMIN });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { count: number; channels: Array<{ name: string; error_code: string }> };
+    expect(body.count).toBe(1);
+    expect(body.channels[0]).toMatchObject({ name: 'Offline One', error_code: 'UPSTREAM_404' });
+  });
+
+  it('GET /api/admin/offline requires admin auth', async () => {
+    const res = await SELF.fetch(`${BASE}/api/admin/offline`);
+    expect(res.status).toBe(401);
+  });
+
+  it('GET /api/admin/channels surfaces health_status per channel', async () => {
+    await seedHealthState();
+    const res = await SELF.fetch(`${BASE}/api/admin/channels`, { headers: ADMIN });
+    expect(res.status).toBe(200);
+    const list = (await res.json()) as Array<{ name: string; health_status: string | null; error_code: string | null }>;
+    const off = list.find((c) => c.name === 'Offline One')!;
+    const on = list.find((c) => c.name === 'Online One')!;
+    expect(off.health_status).toBe('offline');
+    expect(off.error_code).toBe('UPSTREAM_404');
+    expect(on.health_status).toBe('online');
+  });
+
+  it('GET /api/admin/status includes a health summary with the offline count', async () => {
+    await seedHealthState();
+    const res = await SELF.fetch(`${BASE}/api/admin/status`, { headers: ADMIN });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { health: { online: number; offline: number; unknown: number; offline_ratio: number } };
+    expect(body.health).toMatchObject({ online: 1, offline: 1, unknown: 0, offline_ratio: 50 });
+  });
+
+  it('POST /api/admin/health-check runs a sweep and returns the summary', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await resetChannels();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+         VALUES ('beef000000000001', 300011, 'Live', 'https://hc.example.com/live.m3u8', '', '', 1, 0, 1, 1, ?, ?)`,
+      ).bind(now, now),
+      env.DB.prepare(
+        `INSERT INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+         VALUES ('beef000000000002', 300012, 'Dead', 'https://hc.example.com/dead.m3u8', '', '', 1, 1, 1, 1, ?, ?)`,
+      ).bind(now, now),
+    ]);
+    const origin = fetchMock.get('https://hc.example.com');
+    origin.intercept({ path: '/live.m3u8' }).reply(200, HLS_OK);
+    origin.intercept({ path: '/dead.m3u8' }).reply(500, 'boom');
+
+    const res = await SELF.fetch(`${BASE}/api/admin/health-check`, { method: 'POST', headers: ADMIN });
+    expect(res.status).toBe(200);
+    const summary = (await res.json()) as { checked: number; online: number; offline: number };
+    expect(summary).toMatchObject({ checked: 2, online: 1, offline: 1 });
+    // Offline channel now appears in /offline.
+    const off = await SELF.fetch(`${BASE}/api/admin/offline`, { headers: ADMIN });
+    const offBody = (await off.json()) as { count: number };
+    expect(offBody.count).toBe(1);
+  });
+
+  it('GET /api/admin/health-check is not allowed (POST only)', async () => {
+    const res = await SELF.fetch(`${BASE}/api/admin/health-check`, { headers: ADMIN });
+    expect(res.status).toBe(405);
   });
 });

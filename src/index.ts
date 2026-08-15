@@ -3,6 +3,7 @@ import { getRequestId, errorResponse, methodNotAllowed, corsPreflight, logEvent 
 import { ErrorCodes } from './errors/codes';
 import { buildPlaylist, playlistResponse } from './playlist/output';
 import { syncPlaylist } from './playlist/sync';
+import { runScheduledHealthCheck } from './playlist/health';
 import { handleHlsManifest, handleSegment } from './proxy/handlers';
 import { handlePlayerApi, handlePanelApi, handleGetPhp, handleXtreamLive } from './xtream';
 import { handleXmltv } from './epg';
@@ -151,6 +152,8 @@ async function cleanup(env: Env): Promise<void> {
     env.DB.prepare('DELETE FROM stream_failures WHERE created_at < ?').bind(cutoffFailures),
     env.DB.prepare('DELETE FROM sync_logs WHERE started_at < ?').bind(cutoffLogs),
     env.DB.prepare("DELETE FROM devices WHERE last_seen < ? AND status != 'active'").bind(cutoffDevices),
+    // Drop health rows for channels that have since been deactivated/removed.
+    env.DB.prepare('DELETE FROM channel_health WHERE channel_id IN (SELECT id FROM channels WHERE active = 0)'),
   ]);
 }
 
@@ -178,6 +181,11 @@ export default {
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     if (event.cron === '23 3 * * *') {
       ctx.waitUntil(cleanup(env));
+      return;
+    }
+    // Channel health sweep — bounded batch of the oldest-checked channels.
+    if (event.cron === '*/10 * * * *') {
+      ctx.waitUntil(runScheduledHealthCheck(env));
       return;
     }
     // Playlist sync — the settings-based lock makes overlapping runs safe.

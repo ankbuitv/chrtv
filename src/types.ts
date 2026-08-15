@@ -20,6 +20,12 @@ export interface Env {
   SECRET_KEY: string;
   /** Bearer token for the admin API. Admin API is disabled when unset. */
   ADMIN_TOKEN?: string;
+  /**
+   * How many channels the periodic health-check sweep probes per cron tick.
+   * Defaults to 20; capped at MAX_PROBES_PER_RUN. Larger = faster full sweep,
+   * at the cost of more upstream subrequests per invocation.
+   */
+  HEALTH_CHECK_BATCH?: string;
   /** Test-only: D1 migrations injected by vitest-pool-workers. */
   TEST_MIGRATIONS?: unknown;
 }
