@@ -7,6 +7,13 @@ export interface Env {
   EPG_URL: string;
   /** "true" => /tv.m3u works without an access key. */
   PUBLIC_PLAYLIST: string;
+  /**
+   * Optional fallback HLS playlist served when a channel upstream is dead.
+   * When set, the worker fetches + re-proxies this playlist (segments become
+   * /seg/{token}) so players play it instead of stopping. Empty => the empty
+   * "signal lost" error manifest is served.
+   */
+  FALLBACK_M3U_URL?: string;
   /** Secret used for token encryption + credential hashing. Set via wrangler secret. */
   SECRET_KEY: string;
   /** Bearer token for the admin API. Admin API is disabled when unset. */

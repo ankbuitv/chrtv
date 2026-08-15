@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { SELF, env, fetchMock } from 'cloudflare:test';
 import { createToken } from '../src/token';
 import { syncPlaylist } from '../src/playlist/sync';
+import { handleHlsManifest } from '../src/proxy/handlers';
 import { hashPassword, randomHex } from '../src/utils/crypto';
 
 const ADMIN = { Authorization: `Bearer test-admin-token-0123456789` };
@@ -388,6 +389,41 @@ describe('HLS proxy', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('X-CHRTV-Fallback')).toBe('1');
     expect(await res.text()).not.toContain('<html>');
+  });
+
+  it('serves the configured FALLBACK_M3U_URL (re-proxied) when the upstream is dead', async () => {
+    const fallbackManifest = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nfb.ts\n#EXT-X-ENDLIST\n';
+    fetchMock
+      .get('http://fallback.example.com')
+      .intercept({ path: '/hls/index.m3u8' })
+      .reply(200, fallbackManifest, { headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } });
+    fetchMock.get('https://deadfb.example.com').intercept({ path: '/gone.m3u8' }).reply(404, 'not found');
+
+    const token = await mintToken('https://deadfb.example.com/gone.m3u8', { channel: 'fbchannel000001x' });
+    const res = await handleHlsManifest(
+      new Request(`${BASE}/hls/${token}.m3u8`),
+      { ...env, FALLBACK_M3U_URL: 'http://fallback.example.com/hls/index.m3u8' },
+      'req-fallback-123',
+      token,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('X-CHRTV-Fallback')).toBe('1');
+    const body = await res.text();
+    expect(body).toContain(`${BASE}/seg/`);
+    expect(body).not.toContain('fallback.example.com');
+    expect(body).not.toContain('deadfb');
+  });
+
+  it('falls back to the empty error manifest when FALLBACK_M3U_URL is unset', async () => {
+    fetchMock.get('https://deadnb.example.com').intercept({ path: '/gone.m3u8' }).reply(404, 'not found');
+    const token = await mintToken('https://deadnb.example.com/gone.m3u8', { channel: 'nbchannel000001x' });
+    const res = await handleHlsManifest(new Request(`${BASE}/hls/${token}.m3u8`), env, 'req-nofallback-123', token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('X-CHRTV-Fallback')).toBe('1');
+    const body = await res.text();
+    expect(body).toContain('#EXT-X-ENDLIST');
+    expect(body).not.toContain('/seg/');
   });
 
   it('circuit breaker short-circuits repeated requests to a dead channel', async () => {

@@ -114,6 +114,9 @@ Cấu hình trong `wrangler.toml`:
 - `PLAYLIST_URL` — raw URL của `playlists/tv.m3u` trong repo này
 - `EPG_URL` — nguồn XMLTV (tuỳ chọn)
 - `PUBLIC_PLAYLIST` — `"true"` (mặc định): `/tv.m3u` mở tự do; `"false"`: bắt buộc `?key=`
+- `FALLBACK_M3U_URL` — (tuỳ chọn) playlist HLS phát thay khi kênh chết; CHRTV fetch + re-proxy
+  (segment thành `/seg/{token}`) nên player phát bình thường, không lộ URL fallback. Để trống
+  thì dùng manifest "signal lost" rỗng mặc định.
 
 ## Development & test
 
