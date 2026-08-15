@@ -26,6 +26,8 @@ PUBLIC_PLAYLIST = "true"
 # Fallback playlist served when a channel upstream is dead (re-proxied through the worker).
 # Empty => serve the built-in empty "signal lost" manifest instead.
 FALLBACK_M3U_URL = "http://chrtv.duckdns.org:30113/hls/index.m3u8"
+ADMIN_TOKEN = "Q8vLm3Xz7Np2Ka9Rt5Yw4Hs6Bc1Df0Gj"
+SECRET_KEY = "7fK9mQ2xLp8VnR4cYt6Wz3AaHj5Ns0Bd"
 
 [observability]
 enabled = true
