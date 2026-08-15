@@ -13,7 +13,7 @@ crons = [
 [[d1_databases]]
 binding = "DB"
 database_name = "chrtv-db"
-database_id = "00000000-0000-0000-0000-000000000000" # replace after `wrangler d1 create chrtv-db`
+database_id = "5d04f3d6-d3ef-42bc-96df-3d6031561fe6" # replace after `wrangler d1 create chrtv-db`
 migrations_dir = "migrations"
 
 [vars]
