@@ -23,8 +23,6 @@ PLAYLIST_URL = "https://raw.githubusercontent.com/ankbuitv/chrtv/main/playlists/
 EPG_URL = ""
 # "true" => /tv.m3u works without an access key (still token-guarded streams, never an open proxy).
 PUBLIC_PLAYLIST = "true"
-ADMIN_TOKEN = "Q8vLm3Xz7Np2Ka9Rt5Yw4Hs6Bc1Df0Gj"
-SECRET_KEY = "7fK9mQ2xLp8VnR4cYt6Wz3AaHj5Ns0Bd"
 
 [observability]
 enabled = true
