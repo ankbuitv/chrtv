@@ -23,6 +23,9 @@ PLAYLIST_URL = "https://raw.githubusercontent.com/ankbuitv/chrtv/main/playlists/
 EPG_URL = ""
 # "true" => /tv.m3u works without an access key (still token-guarded streams, never an open proxy).
 PUBLIC_PLAYLIST = "true"
+# Fallback playlist served when a channel upstream is dead (re-proxied through the worker).
+# Empty => serve the built-in empty "signal lost" manifest instead.
+FALLBACK_M3U_URL = "http://chrtv.duckdns.org:30113/hls/index.m3u8"
 
 [observability]
 enabled = true

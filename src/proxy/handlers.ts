@@ -13,7 +13,8 @@ import { sha256Hex } from '../utils/crypto';
  *
  * /hls/{token}.m3u8 — manifest proxy: fetch upstream, rewrite URIs against the
  *   FINAL upstream URL, re-tokenize, return. Upstream failures for an
- *   authenticated token => valid CHRTV error manifest (HTTP 200), never HTML.
+ *   authenticated token => fallback playlist (FALLBACK_M3U_URL, re-proxied)
+ *   or the empty error manifest (HTTP 200), never HTML.
  * /seg/{token}[.ext] — media passthrough: body is streamed, Range/206
  *   preserved, nothing buffered. Media failures => plain HTTP errors
  *   (players fall back to re-fetching the manifest, which serves the fallback).
@@ -31,6 +32,59 @@ async function failureKey(payload: { c?: string; u: string }): Promise<string> {
   // Channel-level key when known; otherwise URL-hash so one dead rendition
   // doesn't take down the entire channel entry.
   return payload.c ?? (await sha256Hex(payload.u)).slice(0, 16);
+}
+
+/**
+ * Serve the fallback playlist when a channel upstream is dead.
+ * When FALLBACK_M3U_URL is configured, fetch + rewrite it so the player gets a
+ * playable "signal lost" stream proxied through CHRTV (its segments become
+ * /seg/{token}, everything stays on the worker origin — no mixed-content).
+ * If no fallback is configured, or the fallback itself fails, return the
+ * empty error manifest (a valid ENDED playlist) so players never get HTML.
+ */
+async function serveFallbackManifest(env: Env, req: Request, requestId: string): Promise<Response> {
+  const fallbackUrl = (env.FALLBACK_M3U_URL ?? '').trim();
+  if (!fallbackUrl) return errorManifestResponse(requestId);
+
+  const upstream = await fetchUpstream(fallbackUrl, req, 'GET');
+  if (!upstream.ok) {
+    logEvent(requestId, '/hls', 'FALLBACK_FETCH_FAILED', upstream.code);
+    return errorManifestResponse(requestId);
+  }
+
+  let text: string;
+  try {
+    text = await upstream.response.text();
+  } catch {
+    return errorManifestResponse(requestId);
+  }
+
+  if (!looksLikeHls(text) || text.trim().length === 0) {
+    logEvent(requestId, '/hls', 'FALLBACK_INVALID', '');
+    return errorManifestResponse(requestId);
+  }
+
+  let rewritten: string;
+  try {
+    rewritten = await rewriteManifest(text, {
+      secret: env.SECRET_KEY,
+      baseUrl: upstream.finalUrl,
+      publicOrigin: new URL(req.url).origin,
+    });
+  } catch {
+    return errorManifestResponse(requestId);
+  }
+
+  return new Response(req.method === 'HEAD' ? null : rewritten, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Cache-Control': 'no-store',
+      'Access-Control-Allow-Origin': '*',
+      'X-Request-ID': requestId,
+      'X-CHRTV-Fallback': '1',
+    },
+  });
 }
 
 export async function handleHlsManifest(req: Request, env: Env, requestId: string, rawToken: string): Promise<Response> {
@@ -51,7 +105,7 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
   const failed = await getFailure(fkey);
   if (failed) {
     logEvent(requestId, '/hls', 'CIRCUIT_OPEN', failed.code);
-    return errorManifestResponse(requestId);
+    return serveFallbackManifest(env, req, requestId);
   }
 
   const upstream = await fetchUpstream(payload.u, req, 'GET');
@@ -59,7 +113,7 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
     logEvent(requestId, '/hls', upstream.code, `status=${upstream.status}`);
     await setFailure(fkey, { code: upstream.code, status: upstream.status, at: Date.now() });
     if (payload.c) await recordFailure(env.DB, payload.c, upstream.code, upstream.status);
-    return errorManifestResponse(requestId);
+    return serveFallbackManifest(env, req, requestId);
   }
 
   let text: string;
@@ -67,14 +121,14 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
     text = await upstream.response.text();
   } catch {
     await setFailure(fkey, { code: ErrorCodes.UPSTREAM_UNREACHABLE, status: 0, at: Date.now() });
-    return errorManifestResponse(requestId);
+    return serveFallbackManifest(env, req, requestId);
   }
 
   if (!looksLikeHls(text) || text.trim().length === 0) {
     logEvent(requestId, '/hls', ErrorCodes.INVALID_HLS);
     await setFailure(fkey, { code: ErrorCodes.INVALID_HLS, status: upstream.response.status, at: Date.now() });
     if (payload.c) await recordFailure(env.DB, payload.c, ErrorCodes.INVALID_HLS, upstream.response.status);
-    return errorManifestResponse(requestId);
+    return serveFallbackManifest(env, req, requestId);
   }
 
   let rewritten: string;
@@ -86,7 +140,7 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
     });
   } catch (err) {
     logEvent(requestId, '/hls', ErrorCodes.INVALID_HLS, err instanceof HlsError ? err.message : 'rewrite failed');
-    return errorManifestResponse(requestId);
+    return serveFallbackManifest(env, req, requestId);
   }
 
   return new Response(req.method === 'HEAD' ? null : rewritten, {

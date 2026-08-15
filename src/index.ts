@@ -142,7 +142,7 @@ export default {
     const requestId = getRequestId(req);
     if (!env.SECRET_KEY || env.SECRET_KEY.length < 16) {
       logEvent(requestId, new URL(req.url).pathname, 'CONFIG_ERROR', 'SECRET_KEY missing or too short');
-      return errorResponse(ErrorCodes.DB_ERROR, 500, requestId);
+      return errorResponse(ErrorCodes.CONFIG_ERROR, 500, requestId);
     }
     try {
       const res = await route(req, env, requestId);
@@ -154,7 +154,7 @@ export default {
       return res;
     } catch (err) {
       logEvent(requestId, new URL(req.url).pathname, 'UNHANDLED', err instanceof Error ? err.message : 'unknown');
-      return errorResponse(ErrorCodes.DB_ERROR, 500, requestId);
+      return errorResponse(ErrorCodes.INTERNAL_ERROR, 500, requestId);
     }
   },
 
