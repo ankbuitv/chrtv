@@ -10,13 +10,11 @@ INSERT OR IGNORE INTO settings (key, value) VALUES
   ('sync_lock', ''),
   ('playlist_hash', ''),
   ('playlist_source', ''),
-  ('epg_source', ''),
   ('last_sync', ''),
   ('sync_status', 'never'),
   ('channel_count', '0'),
   ('category_count', '0'),
   ('sync_seq', '0'),
-  ('public_playlist', ''),
   ('playlist_token_ttl', '2592000');
 
 CREATE TABLE IF NOT EXISTS categories (
