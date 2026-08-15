@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { SELF, env, fetchMock } from 'cloudflare:test';
 import { createToken } from '../src/token';
 import { syncPlaylist } from '../src/playlist/sync';
-import { probeChannel, healthCheckBatch } from '../src/playlist/health';
+import { probeChannel, healthCheckBatch, MAX_PROBES_PER_RUN } from '../src/playlist/health';
 import { handleHlsManifest } from '../src/proxy/handlers';
 import { hashPassword, randomHex } from '../src/utils/crypto';
 
@@ -808,6 +808,26 @@ describe('channel health probe', () => {
     expect(r).toMatchObject({ status: 'offline', errorCode: 'UPSTREAM_5XX', httpStatus: 500 });
   });
 
+  it('keeps a 403 (auth/geo-block) as unknown — the probe vantage cannot judge it', async () => {
+    fetchMock.get('https://hprobe.example.com').intercept({ path: '/403.m3u8' }).reply(403, 'Forbidden');
+    const r = await probeChannel('https://hprobe.example.com/403.m3u8');
+    expect(r).toMatchObject({ status: 'unknown', errorCode: 'UPSTREAM_4XX', httpStatus: 403 });
+  });
+
+  it('keeps a 429 (rate-limit) as unknown instead of false-flagging offline', async () => {
+    fetchMock.get('https://hprobe.example.com').intercept({ path: '/429.m3u8' }).reply(429, 'slow down');
+    const r = await probeChannel('https://hprobe.example.com/429.m3u8');
+    expect(r).toMatchObject({ status: 'unknown', errorCode: 'UPSTREAM_4XX', httpStatus: 429 });
+  });
+
+  it('follows a redirect chain that ends in a 403 → unknown (not offline)', async () => {
+    const origin = fetchMock.get('https://hprobe-redir2.example.com');
+    origin.intercept({ path: '/go' }).reply(302, '', { headers: { Location: '/blocked.m3u8' } });
+    origin.intercept({ path: '/blocked.m3u8' }).reply(403, 'Forbidden');
+    const r = await probeChannel('https://hprobe-redir2.example.com/go');
+    expect(r).toMatchObject({ status: 'unknown', errorCode: 'UPSTREAM_4XX', httpStatus: 403 });
+  });
+
   it('flags an unreachable upstream as offline (no interceptor => fetch throws)', async () => {
     const r = await probeChannel('https://hprobe-unreachable.example.com/x.m3u8');
     expect(r).toMatchObject({ status: 'offline', errorCode: 'UPSTREAM_UNREACHABLE' });
@@ -897,6 +917,30 @@ describe('health-check sweep', () => {
       .prepare("SELECT checked_at FROM channel_health WHERE channel_id = 'facade00000000a'")
       .first<{ checked_at: number }>();
     expect(fresh?.checked_at).toBeGreaterThan(0);
+  });
+
+  it('caps every sweep at MAX_PROBES_PER_RUN so Free-plan subrequest limits can never flood false offlines', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await resetChannels();
+    const stmts: D1PreparedStatement[] = [];
+    for (let i = 0; i < 15; i++) {
+      const id = `cafebabe000001${String(i).padStart(2, '0')}`;
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+           VALUES (?, ?, ?, ?, '', '', 1, ?, 1, 9, ?, ?)`,
+        ).bind(id, 210000 + i, `C${i}`, `https://hcap.example.com/c${i}.m3u8`, i, now, now),
+      );
+    }
+    await env.DB.batch(stmts);
+    // No interceptors: every probe throws immediately (unreachable). A request
+    // past the 50-subrequest ceiling would do the same — the point is that the
+    // sweep must never run enough fetches to reach it.
+    const summary = await healthCheckBatch(env, 100);
+    expect(summary.checked).toBe(MAX_PROBES_PER_RUN);
+    expect(summary.checked).toBeLessThanOrEqual(12);
+    const { results } = await env.DB.prepare('SELECT COUNT(*) AS n FROM channel_health').all<{ n: number }>();
+    expect(results[0]?.n).toBe(MAX_PROBES_PER_RUN);
   });
 });
 

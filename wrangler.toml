@@ -7,7 +7,7 @@ compatibility_date = "2026-08-01"
 [triggers]
 crons = [
   "*/15 * * * *", # playlist sync (skips work when hash unchanged)
-  "*/10 * * * *", # channel health sweep (bounded batch; flags dead channels as offline)
+  "*/10 * * * *", # channel health sweep (batch ≤12, subrequest-safe; offline = confirmed dead only)
   "23 3 * * *",   # daily cleanup (old failures / sync logs / stale devices)
 ]
 
