@@ -4,6 +4,7 @@ import { ErrorCodes } from '../errors/codes';
 import { errorResponse, logEvent, methodNotAllowed, corsPreflight } from '../utils/http';
 import { fetchUpstream, passthroughResponse } from './upstream';
 import { isFetchablePort } from '../utils/ports';
+import { isSafeUpstreamUrl } from '../utils/urlsafe';
 import { rewriteManifest, looksLikeHls, HlsError } from '../hls/rewrite';
 import { errorManifestResponse } from '../hls/errorManifest';
 import { getFailure, setFailure, recordFailure } from './failureCache';
@@ -36,63 +37,112 @@ async function failureKey(payload: { c?: string; u: string }): Promise<string> {
 }
 
 /**
- * Serve the fallback playlist when a channel upstream is dead.
- * When FALLBACK_M3U_URL is configured, fetch + rewrite it so the player gets a
- * playable "signal lost" stream proxied through CHRTV (its segments become
- * /seg/{token}, everything stays on the worker origin — no mixed-content).
- * If no fallback is configured, or the fallback itself fails, return the
- * empty error manifest (a valid ENDED playlist) so players never get HTML.
+ * Fallback playlist candidates.
+ * FALLBACK_M3U_URL may list several URLs (comma / whitespace separated); they
+ * are tried in order, so an operator can put a proxyable https source first and
+ * keep a custom-port one as the last resort.
  */
-async function serveFallbackManifest(env: Env, req: Request, requestId: string): Promise<Response> {
-  const fallbackUrl = (env.FALLBACK_M3U_URL ?? '').trim();
-  if (!fallbackUrl) return errorManifestResponse(requestId);
-  // A fallback on a port Workers cannot reach (e.g. :30113) would hang until
-  // the timeout on EVERY dead-channel request — the worst possible latency for
-  // a player that is already struggling. Skip straight to the built-in manifest.
-  if (!isFetchablePort(fallbackUrl)) {
-    logEvent(requestId, '/hls', 'FALLBACK_UNSUPPORTED_PORT', '');
-    return errorManifestResponse(requestId);
-  }
+export function fallbackCandidates(env: Env): string[] {
+  return (env.FALLBACK_M3U_URL ?? '')
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && isSafeUpstreamUrl(s))
+    .slice(0, 5);
+}
 
-  const upstream = await fetchUpstream(fallbackUrl, req, 'GET', 'manifest');
-  if (!upstream.ok) {
-    logEvent(requestId, '/hls', 'FALLBACK_FETCH_FAILED', upstream.code);
-    return errorManifestResponse(requestId);
-  }
-
-  let text: string;
-  try {
-    text = await upstream.response.text();
-  } catch {
-    return errorManifestResponse(requestId);
-  }
-
-  if (!looksLikeHls(text) || text.trim().length === 0) {
-    logEvent(requestId, '/hls', 'FALLBACK_INVALID', '');
-    return errorManifestResponse(requestId);
-  }
-
-  let rewritten: string;
-  try {
-    rewritten = await rewriteManifest(text, {
-      secret: env.SECRET_KEY,
-      baseUrl: upstream.finalUrl,
-      publicOrigin: new URL(req.url).origin,
-    });
-  } catch {
-    return errorManifestResponse(requestId);
-  }
-
-  return new Response(req.method === 'HEAD' ? null : rewritten, {
-    status: 200,
+/**
+ * Redirect the PLAYER straight to the fallback stream.
+ * Used when the fallback lives on a port Cloudflare Workers cannot open a
+ * subrequest to (e.g. :30113) — the worker can never fetch it, but the player
+ * on the user's device has no such restriction, so a 302 makes the fallback
+ * actually play instead of silently degrading to the empty "signal lost"
+ * manifest. Same trick already used for channels on custom ports.
+ */
+function fallbackRedirect(target: string, requestId: string): Response {
+  return new Response(null, {
+    status: 302,
     headers: {
-      'Content-Type': 'application/vnd.apple.mpegurl',
+      Location: target,
       'Cache-Control': 'no-store',
       'Access-Control-Allow-Origin': '*',
       'X-Request-ID': requestId,
       'X-CHRTV-Fallback': '1',
     },
   });
+}
+
+/**
+ * Serve the fallback playlist when a channel upstream is dead.
+ * 1. Any candidate on a Workers-fetchable port is fetched + rewritten, so the
+ *    player gets a playable stream proxied through CHRTV (segments become
+ *    /seg/{token}, everything stays on the worker origin — no mixed content).
+ * 2. If no candidate could be proxied but one lives on a port the worker cannot
+ *    reach, the player is 302-redirected to it and plays it directly.
+ * 3. Only when nothing is configured/usable do we return the empty error
+ *    manifest (a valid ENDED playlist) so players never get HTML.
+ */
+async function serveFallbackManifest(env: Env, req: Request, requestId: string): Promise<Response> {
+  const candidates = fallbackCandidates(env);
+  if (candidates.length === 0) return errorManifestResponse(requestId);
+
+  // Candidates the worker cannot fetch itself, kept for the redirect path.
+  const directOnly: string[] = [];
+
+  for (const fallbackUrl of candidates) {
+    if (!isFetchablePort(fallbackUrl)) {
+      // Fetching it would hang until the timeout on EVERY dead-channel request;
+      // hand it to the player instead (step 2 below).
+      directOnly.push(fallbackUrl);
+      continue;
+    }
+
+    const upstream = await fetchUpstream(fallbackUrl, req, 'GET', 'manifest');
+    if (!upstream.ok) {
+      logEvent(requestId, '/hls', 'FALLBACK_FETCH_FAILED', upstream.code);
+      continue;
+    }
+
+    let text: string;
+    try {
+      text = await upstream.response.text();
+    } catch {
+      continue;
+    }
+
+    if (!looksLikeHls(text) || text.trim().length === 0) {
+      logEvent(requestId, '/hls', 'FALLBACK_INVALID', '');
+      continue;
+    }
+
+    let rewritten: string;
+    try {
+      rewritten = await rewriteManifest(text, {
+        secret: env.SECRET_KEY,
+        baseUrl: upstream.finalUrl,
+        publicOrigin: new URL(req.url).origin,
+      });
+    } catch {
+      continue;
+    }
+
+    return new Response(req.method === 'HEAD' ? null : rewritten, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/vnd.apple.mpegurl',
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': '*',
+        'X-Request-ID': requestId,
+        'X-CHRTV-Fallback': '1',
+      },
+    });
+  }
+
+  if (directOnly.length > 0) {
+    logEvent(requestId, '/hls', 'FALLBACK_REDIRECT', 'unsupported-port');
+    return fallbackRedirect(directOnly[0]!, requestId);
+  }
+
+  return errorManifestResponse(requestId);
 }
 
 export async function handleHlsManifest(req: Request, env: Env, requestId: string, rawToken: string): Promise<Response> {

@@ -9,9 +9,11 @@ export interface Env {
   PUBLIC_PLAYLIST: string;
   /**
    * Optional fallback HLS playlist served when a channel upstream is dead.
-   * When set, the worker fetches + re-proxies this playlist (segments become
-   * /seg/{token}) so players play it instead of stopping. Empty => the empty
-   * "signal lost" error manifest is served.
+   * Comma-separated list allowed; candidates are tried in order.
+   * A candidate on a Workers-fetchable port is fetched + re-proxied (segments
+   * become /seg/{token}); one on a port Workers cannot open (e.g. :30113) is
+   * served to the player as a 302 redirect so it still plays.
+   * Empty => the empty "signal lost" error manifest is served.
    */
   FALLBACK_M3U_URL?: string;
   /** Secret used for token encryption + credential hashing. Set via wrangler secret. */

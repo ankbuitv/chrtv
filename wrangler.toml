@@ -25,16 +25,19 @@ EPG_URL = "https://epg.io.vn/epgc.xml"
 # It also lets Xtream clients (TiviMate / Smarters / OTT Navigator) log in with
 # any username+password, so /get.php and /player_api.php work out of the box.
 PUBLIC_PLAYLIST = "true"
-# Fallback playlist served when a channel upstream is dead (re-proxied through the worker).
+# Fallback playlist served when a channel upstream is dead.
+# Accepts a comma-separated list; candidates are tried in order.
 # Empty => serve the built-in empty "signal lost" manifest instead.
 #
 # NOTE: Cloudflare Workers can only open subrequests on these ports —
 #   http:  80, 8080, 8880, 2052, 2082, 2086, 2095
 #   https: 443, 8443, 2053, 2083, 2087, 2096
-# Port 30113 is NOT in that list, so this fallback can never be fetched from a
-# Worker; CHRTV detects that up-front and serves the built-in manifest instead
-# of hanging for the full timeout on every dead channel. Move the fallback to
-# https://…:443 (or :8443) to actually have it play.
+# Port 30113 is NOT in that list, so the Worker itself can never fetch this
+# fallback. CHRTV detects that up-front and, instead of hanging for the full
+# timeout, 302-redirects the PLAYER straight to it — the player has no port
+# restriction, so the fallback actually plays. Put a fallback on :80/:443/:8080
+# first in the list if you prefer it fully proxied (hides the URL, works for
+# https pages / web players).
 FALLBACK_M3U_URL = "http://chrtv.duckdns.org:30113/hls/index.m3u8"
 ADMIN_TOKEN = "Q8vLm3Xz7Np2Ka9Rt5Yw4Hs6Bc1Df0Gj"
 SECRET_KEY = "7fK9mQ2xLp8VnR4cYt6Wz3AaHj5Ns0Bd"

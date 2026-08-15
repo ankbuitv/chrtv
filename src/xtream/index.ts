@@ -13,6 +13,7 @@ import { isFetchablePort } from '../utils/ports';
  * Implements what real IPTV clients (TiviMate, IPTV Smarters, OTT Navigator)
  * actually call:
  *   /player_api.php (auth, get_live_categories, get_live_streams, ...)
+ *   /panel_api.php  (legacy all-in-one payload)
  *   /get.php        (M3U download)
  *   /live/{user}/{pass}/{stream_id}.m3u8
  *   /xmltv.php      (handled by the EPG module)
@@ -22,6 +23,77 @@ import { isFetchablePort } from '../utils/ports';
  * the client itself supplied — never another user's secret).
  */
 
+/** Credentials as sent by clients — query string, form body, JSON body or Basic auth. */
+export interface XtreamCredentials {
+  username: string;
+  password: string;
+  params: URLSearchParams;
+}
+
+function decodeBasicAuth(header: string | null): { username: string; password: string } | null {
+  if (!header) return null;
+  const m = header.match(/^Basic\s+(.+)$/i);
+  if (!m || !m[1]) return null;
+  try {
+    const decoded = atob(m[1].trim());
+    const idx = decoded.indexOf(':');
+    if (idx === -1) return null;
+    return { username: decoded.slice(0, idx), password: decoded.slice(idx + 1) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract credentials + action params from a request.
+ *
+ * Different clients send them in completely different ways:
+ *   - TiviMate / OTT Navigator: query string
+ *   - IPTV Smarters: POST form body, sometimes a POST JSON body
+ *   - a few web players: HTTP Basic auth
+ * Previously only the query string (and form bodies) were read, so a client
+ * POSTing JSON authenticated as an empty user and got `auth: 0` — i.e. "login
+ * failed" even though the gateway is in public mode.
+ */
+export async function readCredentials(req: Request): Promise<XtreamCredentials> {
+  const url = new URL(req.url);
+  const params = new URLSearchParams(url.search);
+
+  if (req.method === 'POST') {
+    const ctype = (req.headers.get('content-type') ?? '').toLowerCase();
+    try {
+      if (ctype.includes('json')) {
+        const body = (await req.json()) as Record<string, unknown> | null;
+        if (body && typeof body === 'object') {
+          for (const [k, v] of Object.entries(body)) {
+            if ((typeof v === 'string' || typeof v === 'number') && !params.has(k)) params.set(k, String(v));
+          }
+        }
+      } else {
+        // form-urlencoded, multipart, or an unlabelled body — formData() copes
+        // with the first two and throws (harmlessly) otherwise.
+        const form = await req.formData();
+        for (const [k, v] of form.entries()) {
+          if (typeof v === 'string' && !params.has(k)) params.set(k, v);
+        }
+      }
+    } catch {
+      /* fall back to query params */
+    }
+  }
+
+  let username = params.get('username') ?? '';
+  let password = params.get('password') ?? '';
+  if (!username || !password) {
+    const basic = decodeBasicAuth(req.headers.get('Authorization'));
+    if (basic) {
+      username = username || basic.username;
+      password = password || basic.password;
+    }
+  }
+  return { username, password, params };
+}
+
 /**
  * Xtream login.
  *
@@ -30,8 +102,10 @@ import { isFetchablePort } from '../utils/ports';
  * however ALWAYS send a username/password, and previously every one of them was
  * rejected with 401 unless an operator had manually created a D1 user, which is
  * exactly the "can't reach get.php" failure. In public mode we therefore accept
- * any non-empty credential as a guest session; real D1 users still take
- * precedence and a wrong password for an existing user is still rejected.
+ * any credential as a guest session — including an empty one, since some
+ * clients probe the portal before asking the user for credentials. Real D1
+ * users still take precedence and a wrong password for an existing user is
+ * still rejected.
  */
 async function authenticateXtream(env: Env, username: string, password: string): Promise<AuthResult<UserRow>> {
   const direct = await authenticateUser(env, username, password);
@@ -39,16 +113,18 @@ async function authenticateXtream(env: Env, username: string, password: string):
 
   const publicMode = (env.PUBLIC_PLAYLIST ?? 'true').toLowerCase() !== 'false';
   if (!publicMode) return direct;
-  if (!username || !password || username.length > 128 || password.length > 256) return direct;
+  if (username.length > 128 || password.length > 256) return direct;
 
   // Only fall back to guest access when this username is not a registered user.
-  const existing = await env.DB.prepare('SELECT 1 AS x FROM users WHERE username = ?').bind(username).first<{ x: number }>();
-  if (existing) return direct;
+  if (username) {
+    const existing = await env.DB.prepare('SELECT 1 AS x FROM users WHERE username = ?').bind(username).first<{ x: number }>();
+    if (existing) return direct;
+  }
 
   const ts = Math.floor(Date.now() / 1000);
   const guest: UserRow = {
     id: 0,
-    username,
+    username: username || 'guest',
     password_hash: '',
     password_salt: '',
     status: 'active',
@@ -73,19 +149,28 @@ function xtreamUserInfo(username: string, password: string, expiresAt: number | 
       active_cons: '0',
       created_at: '0',
       max_connections: String(maxConnections),
-      allowed_output_formats: ['m3u8'],
+      // Clients pick their stream format from this list. CHRTV proxies HLS, so
+      // m3u8 is first; `ts` stays listed because several clients refuse to log
+      // in when it is missing (they treat the account as "no output format").
+      allowed_output_formats: ['m3u8', 'ts'],
     },
   };
 }
 
 function serverInfo(origin: string) {
   const url = new URL(origin);
+  const isHttps = url.protocol === 'https:';
+  const port = url.port || (isHttps ? '443' : '80');
   return {
     server_info: {
+      xui: false,
+      version: '1.0.0',
+      revision: 1,
       url: url.hostname,
-      port: url.protocol === 'https:' ? '443' : '80',
-      https_port: '443',
+      port: isHttps ? '80' : port,
+      https_port: isHttps ? port : '443',
       server_protocol: url.protocol.replace(':', ''),
+      rtmp_port: '0',
       timezone: 'UTC',
       timestamp_now: Math.floor(Date.now() / 1000),
       time_now: new Date().toISOString().slice(0, 19).replace('T', ' '),
@@ -112,34 +197,22 @@ function liveStreamEntry(ch: ChannelRow, i: number) {
 
 export async function handlePlayerApi(req: Request, env: Env, requestId: string): Promise<Response> {
   const url = new URL(req.url);
-  const params = url.searchParams;
-  // Some Xtream clients POST credentials as form data instead of query params.
-  if (req.method === 'POST' && (req.headers.get('content-type') ?? '').includes('form')) {
-    try {
-      const form = await req.formData();
-      for (const [k, v] of form.entries()) {
-        if (typeof v === 'string' && !params.has(k)) params.set(k, v);
-      }
-    } catch {
-      /* fall back to query params */
-    }
-  }
-  const username = params.get('username') ?? '';
-  const password = params.get('password') ?? '';
+  const { username, password, params } = await readCredentials(req);
 
   const auth = await authenticateXtream(env, username, password);
   if (!auth.ok) {
     logEvent(requestId, '/player_api.php', auth.code);
     // Xtream clients expect a 200 + auth:0 body on bad credentials.
-    return jsonResponse({ user_info: { auth: 0 } }, 200);
+    return jsonResponse({ user_info: { auth: 0, status: 'Disabled' } }, 200);
   }
   const user = auth.value;
   const action = params.get('action') ?? '';
   const origin = url.origin;
+  const info = { ...xtreamUserInfo(username, password, user.expires_at, user.max_connections), ...serverInfo(origin) };
 
   switch (action) {
     case '': // handshake
-      return jsonResponse({ ...xtreamUserInfo(username, password, user.expires_at, user.max_connections), ...serverInfo(origin) });
+      return jsonResponse(info);
     case 'get_live_categories': {
       const cats = await listCategories(env.DB);
       return jsonResponse(cats.map((c) => ({ category_id: String(c.id), category_name: c.name, parent_id: 0 })));
@@ -155,18 +228,50 @@ export async function handlePlayerApi(req: Request, env: Env, requestId: string)
     case 'get_vod_streams':
     case 'get_series':
       return jsonResponse([]);
+    case 'get_vod_info':
+    case 'get_series_info':
+      return jsonResponse({});
     case 'get_short_epg':
     case 'get_simple_data_table':
       return jsonResponse({ epg_listings: [] });
+    case 'get_account_info':
+    case 'get_profile':
+      return jsonResponse(info);
     default:
-      return jsonResponse({ user_info: { auth: 1 } });
+      return jsonResponse(info);
   }
+}
+
+/**
+ * /panel_api.php — legacy all-in-one payload some older clients still use to
+ * log in. It must contain user_info + server_info + the channel/category maps.
+ */
+export async function handlePanelApi(req: Request, env: Env, requestId: string): Promise<Response> {
+  const url = new URL(req.url);
+  const { username, password } = await readCredentials(req);
+  const auth = await authenticateXtream(env, username, password);
+  if (!auth.ok) {
+    logEvent(requestId, '/panel_api.php', auth.code);
+    return jsonResponse({ user_info: { auth: 0, status: 'Disabled' } }, 200);
+  }
+  const user = auth.value;
+  const [channels, cats] = await Promise.all([listActiveChannels(env.DB), listCategories(env.DB)]);
+  const categories: Record<string, string> = {};
+  for (const c of cats) categories[String(c.id)] = c.name;
+
+  return jsonResponse({
+    ...xtreamUserInfo(username, password, user.expires_at, user.max_connections),
+    ...serverInfo(url.origin),
+    categories: { live: categories, movie: {}, series: {} },
+    available_channels: Object.fromEntries(channels.map((ch, i) => [String(ch.xtream_id), liveStreamEntry(ch, i)])),
+  });
 }
 
 /** /get.php?username=..&password=..&type=m3u_plus — full M3U download. */
 export async function handleGetPhp(req: Request, env: Env, requestId: string): Promise<Response> {
   const url = new URL(req.url);
-  const auth = await authenticateXtream(env, url.searchParams.get('username') ?? '', url.searchParams.get('password') ?? '');
+  const { username, password } = await readCredentials(req);
+  const auth = await authenticateXtream(env, username, password);
   if (!auth.ok) {
     logEvent(requestId, '/get.php', auth.code);
     return errorResponse(auth.code, auth.status, requestId);
@@ -225,4 +330,3 @@ export async function handleXtreamLive(
   // Serve the proxied manifest directly (no redirect hop for the player).
   return handleHlsManifest(req, env, requestId, token);
 }
-
