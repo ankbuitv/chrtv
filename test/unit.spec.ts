@@ -160,6 +160,14 @@ https://cdn.example.com/nogroup.m3u8
     expect(res.channels).toHaveLength(3);
     expect(res.skipped).toBe(1);
   });
+  it('accepts channels on non-standard ports', async () => {
+    const customPort = `#EXTM3U\n#EXTINF:-1 tvg-id="custom",Custom Channel\nhttp://chrtv.duckdns.org:18483/stream/cg_hbofam/index.m3u8\n`;
+    const res = await parsePlaylist(customPort);
+    expect(res.channels).toHaveLength(1);
+    expect(res.channels[0]!.url).toBe('http://chrtv.duckdns.org:18483/stream/cg_hbofam/index.m3u8');
+    expect(res.skipped).toBe(0);
+  });
+
   it('skips unsafe URLs', async () => {
     const bad = '#EXTM3U\n#EXTINF:-1,Evil\nhttp://127.0.0.1/x.m3u8\n#EXTINF:-1,Good\nhttps://ok.example.com/x.m3u8\n';
     const res = await parsePlaylist(bad);

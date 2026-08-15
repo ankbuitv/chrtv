@@ -2,6 +2,7 @@ import type { ChannelRow, Env } from '../types';
 import { listActiveChannels } from '../db/channels';
 import { createToken, TOKEN_STABILITY_WINDOW } from '../token';
 import { getSetting } from '../db/settings';
+import { isFetchablePort } from '../utils/ports';
 
 const DEFAULT_PLAYLIST_TOKEN_TTL = 30 * 24 * 60 * 60; // 30 days
 
@@ -47,7 +48,11 @@ export async function buildPlaylist(env: Env, origin: string): Promise<string> {
       .filter(Boolean)
       .join(' ');
     lines.push(`#EXTINF:-1 ${attrs},${escapeName(ch.name)}`);
-    lines.push(`${origin}/hls/${tokens[i]}.m3u8`);
+    if (isFetchablePort(ch.url)) {
+      lines.push(`${origin}/hls/${tokens[i]}.m3u8`);
+    } else {
+      lines.push(ch.url);
+    }
   });
 
   return lines.join('\n') + '\n';

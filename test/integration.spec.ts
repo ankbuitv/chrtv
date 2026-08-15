@@ -95,6 +95,21 @@ describe('/tv.m3u playlist', () => {
     expect(body).not.toContain('up.example.com'); // upstream never exposed
   });
 
+  it('serves direct URLs for channels with non-standard ports in playlist', async () => {
+    await seedChannels();
+    const now = Math.floor(Date.now() / 1000);
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+       VALUES ('aaaaaaaaaaaaaaa3', 100003, 'HBO Custom', 'http://chrtv.duckdns.org:18483/stream/cg_hbofam/index.m3u8', 'hbo-custom', '', 1, 2, 1, 1, ?, ?)`,
+    ).bind(now, now).run();
+
+    const res = await SELF.fetch(`${BASE}/tv.m3u`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('HBO Custom');
+    expect(body).toContain('http://chrtv.duckdns.org:18483/stream/cg_hbofam/index.m3u8');
+  });
+
   it('/xem.m3u is an alias of the same playlist', async () => {
     await seedChannels();
     const [a, b] = await Promise.all([SELF.fetch(`${BASE}/tv.m3u`), SELF.fetch(`${BASE}/xem.m3u`)]);
@@ -475,6 +490,20 @@ describe('HLS proxy', () => {
     expect(bad.status).toBe(401);
     const missing = await SELF.fetch(`${BASE}/live/bob/password123/999999.m3u8`);
     expect(missing.status).toBe(404);
+  });
+
+  it('/live/{user}/{pass}/{id}.m3u8 redirects 302 for channels on custom ports', async () => {
+    await seedChannels();
+    const now = Math.floor(Date.now() / 1000);
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+       VALUES ('aaaaaaaaaaaaaaa4', 100004, 'HBO Live', 'http://chrtv.duckdns.org:18483/stream/cg_hbofam/index.m3u8', 'hbo-live', '', 1, 3, 1, 1, ?, ?)`,
+    ).bind(now, now).run();
+    await seedUser('bob', 'password123');
+
+    const res = await SELF.fetch(`${BASE}/live/bob/password123/100004.m3u8`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe('http://chrtv.duckdns.org:18483/stream/cg_hbofam/index.m3u8');
   });
 });
 

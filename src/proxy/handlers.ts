@@ -107,6 +107,20 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
     return errorResponse(ErrorCodes[verdict.code], status, requestId);
   }
   const payload = verdict.payload;
+
+  // Ports that Cloudflare Workers cannot open subrequests to are redirected
+  // directly so the client player can stream them directly.
+  if (!isFetchablePort(payload.u)) {
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: payload.u,
+        'Access-Control-Allow-Origin': '*',
+        'X-Request-ID': requestId,
+      },
+    });
+  }
+
   const fkey = await failureKey(payload);
 
   // Circuit breaker: known-dead upstream inside TTL => immediate fallback manifest.
@@ -172,6 +186,17 @@ export async function handleSegment(req: Request, env: Env, requestId: string, r
     logEvent(requestId, '/seg', verdict.code);
     const status = verdict.code === 'TOKEN_EXPIRED' ? 410 : 403;
     return errorResponse(ErrorCodes[verdict.code], status, requestId);
+  }
+
+  if (!isFetchablePort(verdict.payload.u)) {
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: verdict.payload.u,
+        'Access-Control-Allow-Origin': '*',
+        'X-Request-ID': requestId,
+      },
+    });
   }
 
   const isHead = req.method === 'HEAD';
