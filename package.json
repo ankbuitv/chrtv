@@ -1,0 +1,23 @@
+{
+  "name": "chrtv",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CHRTV — Cloud IPTV Gateway on Cloudflare Workers",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "wrangler deploy --dry-run --outdir=dist",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "db:migrate": "wrangler d1 migrations apply chrtv-db --remote",
+    "db:migrate:local": "wrangler d1 migrations apply chrtv-db --local"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.71",
+    "@cloudflare/workers-types": "^5.20260811.1",
+    "typescript": "^5.6.0",
+    "vitest": "~3.2.0",
+    "wrangler": "^4.0.0"
+  }
+}

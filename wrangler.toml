@@ -1,0 +1,32 @@
+# CHRTV — Cloud IPTV Gateway
+name = "chrtv"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+# Playlist auto-sync + housekeeping
+[triggers]
+crons = [
+  "*/15 * * * *", # playlist sync (skips work when hash unchanged)
+  "23 3 * * *",   # daily cleanup (old failures / sync logs / stale devices)
+]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "chrtv-db"
+database_id = "00000000-0000-0000-0000-000000000000" # replace after `wrangler d1 create chrtv-db`
+migrations_dir = "migrations"
+
+[vars]
+# Source of truth: the M3U in this GitHub repository (raw URL).
+PLAYLIST_URL = "https://raw.githubusercontent.com/ankbuitv/chrtv/main/playlists/tv.m3u"
+# Optional XMLTV EPG source. Leave empty to serve a minimal valid XMLTV document.
+EPG_URL = ""
+# "true" => /tv.m3u works without an access key (still token-guarded streams, never an open proxy).
+PUBLIC_PLAYLIST = "true"
+
+[observability]
+enabled = true
+
+# Secrets (set with `wrangler secret put <NAME>`):
+#   SECRET_KEY  — 32+ random chars; encrypts stream tokens & hashes credentials
+#   ADMIN_TOKEN — bearer token for /api/admin/* (admin API disabled if unset)
