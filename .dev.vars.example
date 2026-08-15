@@ -1,0 +1,4 @@
+# Copy to .dev.vars for local development (`wrangler dev`).
+# NEVER commit .dev.vars.
+SECRET_KEY="replace-with-32-plus-random-characters"
+ADMIN_TOKEN="replace-with-a-long-random-admin-token"
