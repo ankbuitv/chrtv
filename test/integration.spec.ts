@@ -443,6 +443,23 @@ describe('HLS proxy', () => {
     if (verdict.ok) expect(verdict.payload.u).toBe('https://up3.example.com/live/deep/chunk1.ts');
   });
 
+  it('gives slow relays the full 30s — a manifest answering past the old 8s cap is still proxied, no fallback', {
+    timeout: 25_000,
+  }, async () => {
+    const manifest = '#EXTM3U\\n#EXT-X-TARGETDURATION:6\\n#EXTINF:6.0,\\nslow1.ts\\n#EXT-X-ENDLIST\\n';
+    fetchMock
+      .get('https://slowup.example.com')
+      .intercept({ path: '/live/index.m3u8' })
+      .reply(200, manifest)
+      .delay(8_500); // dead under the old 8s manifest timeout; alive under the 30s policy
+
+    const token = await mintToken('https://slowup.example.com/live/index.m3u8');
+    const res = await SELF.fetch(`${BASE}/hls/${token}.m3u8`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('X-CHRTV-Fallback')).toBeNull();
+    expect(await res.text()).toContain('#EXTM3U');
+  });
+
   it('upstream 404 returns a valid CHRTV error manifest (not HTML)', async () => {
     fetchMock.get('https://dead1.example.com').intercept({ path: '/gone.m3u8' }).reply(404, 'not found');
     const token = await mintToken('https://dead1.example.com/gone.m3u8', { channel: 'deadchannel0001x' });
@@ -848,6 +865,16 @@ describe('channel health probe', () => {
     origin.intercept({ path: '/go' }).reply(302, '', { headers: { Location: '/final/index.m3u8' } });
     origin.intercept({ path: '/final/index.m3u8' }).reply(200, HLS_OK);
     const r = await probeChannel('https://hprobe-redir.example.com/go');
+    expect(r).toMatchObject({ status: 'online', httpStatus: 200 });
+  });
+
+  it('does NOT flag a slow relay offline — answers past the old 6s cap are still online', {
+    timeout: 25_000,
+  }, async () => {
+    // devda-style relay: first byte takes ~10-25s. Under the old 6s probe
+    // timeout this was flagged offline on every sweep; policy is now 30s.
+    fetchMock.get('https://hprobe-slow.example.com').intercept({ path: '/slow.m3u8' }).reply(200, HLS_OK).delay(7_000);
+    const r = await probeChannel('https://hprobe-slow.example.com/slow.m3u8');
     expect(r).toMatchObject({ status: 'online', httpStatus: 200 });
   });
 });

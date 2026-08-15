@@ -3,13 +3,17 @@ import { isFetchablePort } from '../utils/ports';
 import { ErrorCodes, type ErrorCode } from '../errors/codes';
 
 /**
- * Timeouts are split by resource kind: a live manifest must arrive fast or the
- * player stalls ("connection is unstable"), while a media segment legitimately
- * takes longer. A single 15s timeout for both was the main source of long
- * freezes before falling back.
+ * Operator policy: an upstream is only declared dead after **30s of silence**.
+ * Slow relays (e.g. devda.undo.it bouncing to the real CDN) routinely take
+ * 10-25s to first byte — slow to tune in, but perfectly watchable. Cutting
+ * them off at 6-8s tripped the circuit breaker on healthy channels, which is
+ * exactly how "kênh hệ thống xem bình thường mà bị báo offline" happens.
+ * Kept as two constants so operators can still tune manifest vs segment
+ * separately, but both default to the same 30s ceiling. (Player-side fetch
+ * waits don't count against Workers CPU time, only wall clock.)
  */
-const MANIFEST_TIMEOUT_MS = 8_000;
-const SEGMENT_TIMEOUT_MS = 20_000;
+const MANIFEST_TIMEOUT_MS = 30_000;
+const SEGMENT_TIMEOUT_MS = 30_000;
 
 /**
  * Request headers forwarded to the upstream. Auth/cookies are never forwarded.
@@ -45,9 +49,15 @@ async function cancelBody(res: Response): Promise<void> {
   }
 }
 
-/** Transient failures worth one immediate retry (a single hiccup should not kill the channel). */
+/**
+ * Transient failures worth one immediate retry — fast-failing kinds only
+ * (connection refused / 5xx come back instantly, so a retry costs nothing).
+ * A 30s timeout is NOT a hiccup, it is already a conclusive verdict; retrying
+ * it would just stretch "quá 30s mới offline" into 60s before the player ever
+ * sees the fallback.
+ */
 function isRetryable(code: ErrorCode): boolean {
-  return code === ErrorCodes.UPSTREAM_TIMEOUT || code === ErrorCodes.UPSTREAM_UNREACHABLE || code === ErrorCodes.UPSTREAM_5XX;
+  return code === ErrorCodes.UPSTREAM_UNREACHABLE || code === ErrorCodes.UPSTREAM_5XX;
 }
 
 async function fetchOnce(
@@ -115,7 +125,8 @@ async function fetchOnce(
  * - validates URL safety + port reachability immediately before fetching
  * - follows redirects MANUALLY (max 5 hops) so every hop is checked and
  *   `finalUrl` is deterministic for relative URI resolution
- * - retries once on a transient failure (timeout / network / 5xx)
+ * - retries once on a fast transient failure (network / 5xx); a 30s timeout
+ *   is conclusive and is never retried
  * - never forwards client cookies/authorization headers upstream
  */
 export async function fetchUpstream(

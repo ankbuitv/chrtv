@@ -2,7 +2,7 @@
  * Cloudflare Workers can only open subrequests to a fixed set of ports.
  * A fetch to any other port is silently rewritten to 80/443 (or simply resets),
  * which shows up in players as random stalls / "connection is unstable".
- * We therefore refuse such URLs up-front instead of burning a 10-15s timeout
+ * We therefore refuse such URLs up-front instead of burning a 30s timeout
  * on every single request.
  *
  * https://developers.cloudflare.com/workers/runtime-apis/fetch/

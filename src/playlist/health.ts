@@ -66,7 +66,16 @@ export interface HealthStats {
   last_checked: number;
 }
 
-const PROBE_TIMEOUT_MS = 6_000;
+/**
+ * A probe only counts as timed out after **30s of silence** — same bar the
+ * proxy uses. Slow relays (devda.undo.it → real CDN, 10-25s TTFB, possibly
+ * several redirect hops) load slowly but play fine; with a 6s timeout the
+ * sweep flagged those healthy channels `offline` on every rotation even
+ * though viewers watched them without any problem. The timeout applies per
+ * fetch (each redirect hop), so the whole redirect chain is given the same
+ * grace a real player would get.
+ */
+const PROBE_TIMEOUT_MS = 30_000;
 const MAX_REDIRECTS = 3;
 const PROBE_PREFIX_BYTES = 64 * 1024;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
@@ -86,8 +95,15 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
  * operators may raise this safely.
  */
 export const MAX_PROBES_PER_RUN = 12;
-/** Concurrency used inside a sweep — gentle on upstreams, caps tail latency. */
-const PROBE_CONCURRENCY = 8;
+/**
+ * All probes fire in a single wave (concurrency = batch size). With a 30s
+ * per-probe timeout, stacking waves (e.g. 8+4) would push a sweep full of dead
+ * upstreams to ~60s wall clock — past the cron trigger limit on the Free plan —
+ * and every result would be lost. One wave keeps the worst case at roughly one
+ * probe duration; upstreams are all distinct hosts, so 12 concurrent probes
+ * stay gentle.
+ */
+const PROBE_CONCURRENCY = MAX_PROBES_PER_RUN;
 /** Default sweep size for the periodic cron trigger. */
 export const DEFAULT_HEALTH_BATCH = MAX_PROBES_PER_RUN;
 
@@ -244,26 +260,32 @@ export async function healthCheckBatch(env: Env, limit: number): Promise<HealthC
     .bind(cap)
     .all<{ id: string; url: string }>();
 
-  const probed = await mapWithConcurrency(results, PROBE_CONCURRENCY, async (ch) => ({
-    id: ch.id,
-    ...(await probeChannel(ch.url)),
-  }));
-
   const now = Math.floor(Date.now() / 1000);
-  const stmts = probed.map((r) =>
-    env.DB
-      .prepare(
-        `INSERT INTO channel_health (channel_id, status, error_code, http_status, checked_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(channel_id) DO UPDATE SET
-           status = excluded.status,
-           error_code = excluded.error_code,
-           http_status = excluded.http_status,
-           checked_at = excluded.checked_at`,
-      )
-      .bind(r.id, r.status, r.errorCode, r.httpStatus, now),
-  );
-  for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+  const probed = await mapWithConcurrency(results, PROBE_CONCURRENCY, async (ch) => {
+    const r = { id: ch.id, ...(await probeChannel(ch.url)) };
+    // Persist each result the moment it lands instead of one batch write at
+    // the end: with a 30s probe timeout, a sweep full of dead upstreams can
+    // brush against the cron wall-clock limit, and a final write would lose
+    // every finished probe — leaving the same slow channels "oldest checked"
+    // forever, hogging every future sweep.
+    try {
+      await env.DB
+        .prepare(
+          `INSERT INTO channel_health (channel_id, status, error_code, http_status, checked_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(channel_id) DO UPDATE SET
+             status = excluded.status,
+             error_code = excluded.error_code,
+             http_status = excluded.http_status,
+             checked_at = excluded.checked_at`,
+        )
+        .bind(r.id, r.status, r.errorCode, r.httpStatus, now)
+        .run();
+    } catch {
+      /* health persistence must never break the sweep — next rotation retries */
+    }
+    return r;
+  });
 
   const summary: HealthCheckSummary = { checked: probed.length, online: 0, offline: 0, unknown: 0 };
   for (const r of probed) {
