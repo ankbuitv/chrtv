@@ -6,6 +6,7 @@ import { buildPlaylist, playlistResponse } from '../playlist/output';
 import { jsonResponse, errorResponse, logEvent } from '../utils/http';
 import { ErrorCodes } from '../errors/codes';
 import { handleHlsManifest } from '../proxy/handlers';
+import { isFetchablePort } from '../utils/ports';
 
 /**
  * Xtream Codes compatibility layer.
@@ -201,6 +202,17 @@ export async function handleXtreamLive(
   if (!Number.isInteger(xtreamId)) return errorResponse(ErrorCodes.NOT_FOUND, 404, requestId);
   const channel = await getChannelByXtreamId(env.DB, xtreamId);
   if (!channel) return errorResponse(ErrorCodes.NOT_FOUND, 404, requestId);
+
+  if (!isFetchablePort(channel.url)) {
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: channel.url,
+        'Access-Control-Allow-Origin': '*',
+        'X-Request-ID': requestId,
+      },
+    });
+  }
 
   const now = Math.floor(Date.now() / 1000);
   const token = await createToken(env.SECRET_KEY, {

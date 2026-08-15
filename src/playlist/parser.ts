@@ -1,6 +1,5 @@
 import { sha256Hex } from '../utils/crypto';
 import { isSafeUpstreamUrl } from '../utils/urlsafe';
-import { isFetchablePort } from '../utils/ports';
 
 export interface ParsedChannel {
   id: string;
@@ -65,7 +64,7 @@ export async function parsePlaylist(text: string): Promise<ParseResult> {
     if (!pending) continue; // URL without EXTINF
     const { name, attrs } = pending;
     pending = null;
-    if (!name || !isSafeUpstreamUrl(line) || !isFetchablePort(line)) {
+    if (!name || !isSafeUpstreamUrl(line)) {
       skipped++;
       continue;
     }
