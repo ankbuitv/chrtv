@@ -42,7 +42,7 @@ GitHub M3U (playlists/tv.m3u)
 - **Token**: AES-256-GCM, chứa upstream URL + iat/exp, tamper-proof, tự hết hạn. Upstream URL không bao giờ lộ ra ngoài.
 - **SSRF guard**: chỉ http/https public; chặn localhost, private IP, link-local, metadata endpoints — kiểm tra cả từng hop redirect.
 - **Circuit breaker**: upstream fail → failure state TTL 30s trong Cloudflare Cache; trong TTL trả ngay fallback manifest, hết TTL tự retry.
-- **Channel health sweep**: cron `*/10 * * * *` chủ động probe batch kênh nhỏ (ưu tiên chưa check), đánh dấu `channel_health` online/offline/unknown → lộ ra qua `/api/admin/offline` + `health_status` ở `/api/admin/channels`. Bắt cả link "200 + HTML lỗi". `offline` chỉ khi kênh chết **chắc chắn** (404/410, 5xx, timeout, host không tới được, 200 + không phải HLS); 401/403/429/451 (auth/geo-block/rate-limit) và port không fetch được → `unknown`, không bao giờ gán offline sai.
+- **Channel health sweep**: cron `*/10 * * * *` chủ động probe batch kênh nhỏ (ưu tiên chưa check), đánh dấu `channel_health` online/offline/unknown → lộ ra qua `/api/admin/offline` + `health_status` ở `/api/admin/channels`. Bắt cả link "200 + HTML lỗi". `offline` chỉ khi kênh chết **chắc chắn** (404/410, 5xx, **im lặng quá 30s**, host không tới được, 200 + không phải HLS); 401/403/429/451 (auth/geo-block/rate-limit) và port không fetch được → `unknown`, không bao giờ gán offline sai.
 - **Playlist sync an toàn**: playlist mới lỗi → giữ nguyên version cũ, đánh dấu sync failed. Hash không đổi → không ghi lại DB.
 
 ## Routes
@@ -101,8 +101,13 @@ playlist mãi. CHRTV bổ sung một **health sweep chủ động**:
 - Mỗi probe fetch upstream (cùng luật SSRF + port-safe như proxy), follow redirect,
   và **xác nhận body thật sự là HLS** — nên link "200 + HTML lỗi" cũng bị đánh
   offline, không chỉ 4xx/5xx/timeout.
-- **Chỉ kết luận `offline` khi kênh chết chắc chắn**: 404/410, 5xx, timeout, host
-  không tới được, hoặc 200 + body không phải HLS. Các trường hợp phụ thuộc vị trí
+- **Probe chờ tới 30s** (mỗi hop redirect) trước khi kết luận timeout: relay chậm
+  kiểu devda.undo.it bounce qua CDN mất 10-25s mới ra byte đầu — load lâu nhưng
+  vẫn phát bình thường. Timeout ngắn (6-8s) gán offline oan cho mấy kênh này
+  mỗi lần quét.
+- **Chỉ kết luận `offline` khi kênh chết chắc chắn**: 404/410, 5xx, im lặng quá
+  30s, host không tới được, hoặc 200 + body không phải HLS. Các trường hợp phụ
+  thuộc vị trí
   probe — 401/403/429/451 (auth / geo-block / rate-limit), port Worker không fetch
   được (vd `:30113`, player tự phát trực tiếp) — đánh dấu `unknown` kèm `error_code`,
   **không** bao giờ tính là offline. Cron trigger chạy ở **colo ngẫu nhiên** của
@@ -188,8 +193,12 @@ CHRTV kiểm tra trước khi fetch:
 - **Token ổn định**: cùng một segment/kênh luôn ra cùng một URL trong cửa sổ 10 phút
   (IV suy ra bằng HMAC thay vì random) → player tái sử dụng buffer, không tải lại
   toàn bộ segment mỗi lần refresh manifest.
-- **Timeout tách biệt**: manifest 8s (live phải nhanh), segment 20s.
-- **Retry 1 lần** cho lỗi tạm thời (timeout / mạng / 5xx) trước khi mở circuit breaker.
+- **Timeout 30s cho cả manifest lẫn segment**: relay chậm (devda.undo.it → CDN)
+  load 10-25s vẫn vào kênh bình thường — chỉ khi upstream **im lặng quá 30s** mới
+  tính chết, mở circuit breaker và bật fallback.
+- **Retry 1 lần** cho lỗi tạm thởi fail nhanh (mạng / 5xx) trước khi mở circuit
+  breaker. Timeout 30s đã là kết luận đủ chắc nên **không retry** (tránh kéo
+  dài 60s trước khi player nhận được fallback).
 - **SEGMENT_TTL 60 phút** (trước là 15) → token không hết hạn giữa chừng khi đang xem.
 - **Không forward `accept-encoding`**, ép `identity` → body không bị giải nén lệch
   `Content-Length` làm player thấy segment cụt.
