@@ -18,9 +18,9 @@ migrations_dir = "migrations"
 
 [vars]
 # Source of truth: the M3U in this GitHub repository (raw URL).
-PLAYLIST_URL = "https://raw.githubusercontent.com/ankbuitv/chrtv/main/playlists/tv.m3u"
+PLAYLIST_URL = "https://raw.githubusercontent.com/ankbuitv/mytv/refs/heads/main/playlist.m3u"
 # Optional XMLTV EPG source. Leave empty to serve a minimal valid XMLTV document.
-EPG_URL = ""
+EPG_URL = "https://epg.io.vn/epgc.xml"
 # "true" => /tv.m3u works without an access key (still token-guarded streams, never an open proxy).
 PUBLIC_PLAYLIST = "true"
 # Fallback playlist served when a channel upstream is dead (re-proxied through the worker).
