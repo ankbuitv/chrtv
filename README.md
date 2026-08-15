@@ -114,9 +114,13 @@ Cấu hình trong `wrangler.toml`:
 - `PLAYLIST_URL` — raw URL của `playlists/tv.m3u` trong repo này
 - `EPG_URL` — nguồn XMLTV (tuỳ chọn)
 - `PUBLIC_PLAYLIST` — `"true"` (mặc định): `/tv.m3u` mở tự do; `"false"`: bắt buộc `?key=`
-- `FALLBACK_M3U_URL` — (tuỳ chọn) playlist HLS phát thay khi kênh chết; CHRTV fetch + re-proxy
-  (segment thành `/seg/{token}`) nên player phát bình thường, không lộ URL fallback. Để trống
-  thì dùng manifest "signal lost" rỗng mặc định.
+- `FALLBACK_M3U_URL` — (tuỳ chọn) playlist HLS phát thay khi kênh chết. Cho phép **nhiều URL,
+  ngăn cách bằng dấu phẩy**, thử lần lượt:
+  1. URL nằm trên port Worker fetch được → CHRTV fetch + re-proxy (segment thành `/seg/{token}`),
+     không lộ URL fallback, chạy được cả trên trang https.
+  2. URL nằm trên port Worker **không** fetch được (ví dụ `:30113`) → CHRTV **302 redirect thẳng
+     player** tới đó. Player trên thiết bị người dùng không bị giới hạn port nên vẫn phát bình thường.
+  3. Không có URL nào dùng được → manifest "signal lost" rỗng mặc định.
 
 ### ⚠️ Cổng (port) mà Cloudflare Workers fetch được
 
@@ -130,10 +134,11 @@ hoặc treo tới hết timeout → player báo **"connection is unstable"**:
 
 CHRTV kiểm tra trước khi fetch:
 
-- URL kênh trong playlist dùng port không hợp lệ → **bị loại khi sync** (không đưa vào D1).
+- URL kênh trong playlist dùng port không hợp lệ → **trả thẳng URL gốc** cho player (`/tv.m3u`)
+  hoặc **302 redirect** (`/live/...`), player tự phát trực tiếp.
 - URI trong manifest dùng port không hợp lệ → **không rewrite**, không proxy.
-- `FALLBACK_M3U_URL` dùng port không hợp lệ (ví dụ `:30113`) → dùng ngay manifest
-  "signal lost" có sẵn thay vì treo timeout ở mọi request kênh chết.
+- `FALLBACK_M3U_URL` dùng port không hợp lệ (ví dụ `:30113`) → **302 redirect player** tới URL đó
+  thay vì treo timeout hoặc im lặng trả manifest rỗng.
 
 ### Chống "connection is unstable"
 
@@ -149,9 +154,21 @@ CHRTV kiểm tra trước khi fetch:
 ### Xtream Codes
 
 Khi `PUBLIC_PLAYLIST="true"`, client Xtream đăng nhập bằng **bất kỳ**
-username/password nào cũng được (`/get.php`, `/player_api.php`, `/live/...`),
-vì playlist vốn đã mở. Nếu username trùng user có trong D1 thì vẫn phải đúng
-mật khẩu. Đặt `PUBLIC_PLAYLIST="false"` để bắt buộc tài khoản thật.
+username/password nào cũng được (kể cả để trống), vì playlist vốn đã mở.
+Nếu username trùng user có trong D1 thì vẫn phải đúng mật khẩu.
+Đặt `PUBLIC_PLAYLIST="false"` để bắt buộc tài khoản thật.
+
+CHRTV đọc thông tin đăng nhập từ **mọi cách client gửi**: query string,
+form POST, **JSON POST** (IPTV Smarters) và **HTTP Basic auth**.
+
+Endpoint được hỗ trợ:
+
+| Route | Dùng bởi |
+|---|---|
+| `/player_api.php`, `/player-api.php`, `/playerapi.php` | TiviMate, Smarters, OTT Navigator |
+| `/panel_api.php` | client cũ (trả nguyên `available_channels` + `categories`) |
+| `/get.php`, `/enigma2.php` | tải M3U |
+| `/live/{u}/{p}/{id}`, `/{u}/{p}/{id}` | phát kênh (dạng có và không có tiền tố `/live`) |
 
 Cấu hình trong player:
 

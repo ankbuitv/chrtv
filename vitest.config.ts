@@ -18,6 +18,11 @@ export default defineWorkersConfig(async () => {
               PLAYLIST_URL: 'https://raw.example.com/playlists/tv.m3u',
               EPG_URL: '',
               PUBLIC_PLAYLIST: 'true',
+              // Tests that exercise fallback behaviour pass FALLBACK_M3U_URL
+              // explicitly; the default stays empty so the built-in "signal
+              // lost" manifest is the baseline (wrangler.toml's real value
+              // must not leak into the test worker).
+              FALLBACK_M3U_URL: '',
             },
           },
         },

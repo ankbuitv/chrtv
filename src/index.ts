@@ -4,7 +4,7 @@ import { ErrorCodes } from './errors/codes';
 import { buildPlaylist, playlistResponse } from './playlist/output';
 import { syncPlaylist } from './playlist/sync';
 import { handleHlsManifest, handleSegment } from './proxy/handlers';
-import { handlePlayerApi, handleGetPhp, handleXtreamLive } from './xtream';
+import { handlePlayerApi, handlePanelApi, handleGetPhp, handleXtreamLive } from './xtream';
 import { handleXmltv } from './epg';
 import { handleAdmin } from './admin';
 import { authenticateAccessKey } from './auth';
@@ -87,16 +87,33 @@ async function route(req: Request, env: Env, requestId: string): Promise<Respons
   if (path.startsWith('/seg/')) return handleSegment(req, env, requestId, path.slice('/seg/'.length));
 
   // ---- Xtream Codes ----
-  if (path === '/player_api.php' || path === '/player-api.php' || path === '/panel_api.php') {
-    if (req.method !== 'GET' && req.method !== 'POST') return methodNotAllowed(['GET', 'POST'], requestId);
+  if (path === '/player_api.php' || path === '/player-api.php' || path === '/playerapi.php') {
+    if (req.method === 'OPTIONS') return corsPreflight();
+    if (req.method !== 'GET' && req.method !== 'POST' && req.method !== 'HEAD') {
+      return methodNotAllowed(['GET', 'POST', 'HEAD', 'OPTIONS'], requestId);
+    }
     return handlePlayerApi(req, env, requestId);
   }
-  if (path === '/get.php') {
+  if (path === '/panel_api.php') {
     if (req.method === 'OPTIONS') return corsPreflight();
+    if (req.method !== 'GET' && req.method !== 'POST' && req.method !== 'HEAD') {
+      return methodNotAllowed(['GET', 'POST', 'HEAD', 'OPTIONS'], requestId);
+    }
+    return handlePanelApi(req, env, requestId);
+  }
+  if (path === '/get.php' || path === '/getphp' || path === '/enigma2.php') {
+    if (req.method === 'OPTIONS') return corsPreflight();
+    if (req.method === 'POST') return handleGetPhp(req, env, requestId);
     if (!STREAM_METHODS.includes(req.method)) return methodNotAllowed(STREAM_METHODS, requestId);
     return handleGetPhp(req, env, requestId);
   }
-  const liveMatch = path.match(/^\/live\/([^/]+)\/([^/]+)\/([^/]+)$/);
+  // /live/{u}/{p}/{id} plus the movie/series prefixes clients probe on login,
+  // and the bare /{u}/{p}/{numeric id}(.m3u8|.ts) form some clients build when
+  // the portal URL has no /live prefix (kept strict so it cannot shadow other
+  // routes: the stream id must be numeric).
+  const liveMatch =
+    path.match(/^\/(?:live|movie|series)\/([^/]+)\/([^/]+)\/([^/]+)$/) ??
+    path.match(/^\/([^/]+)\/([^/]+)\/(\d+(?:\.(?:m3u8|ts))?)$/);
   if (liveMatch) {
     if (req.method === 'OPTIONS') return corsPreflight();
     if (!STREAM_METHODS.includes(req.method)) return methodNotAllowed(STREAM_METHODS, requestId);

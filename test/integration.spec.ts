@@ -306,6 +306,60 @@ describe('Xtream Codes API', () => {
     expect(res.status).toBe(200);
   });
 
+  it('accepts POSTed JSON credentials (IPTV Smarters style)', async () => {
+    await seedChannels();
+    const res = await SELF.fetch(`${BASE}/player_api.php`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'jsonuser', password: 'jsonpass' }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { user_info: { auth: number }; server_info: { url: string } };
+    expect(body.user_info.auth).toBe(1);
+    expect(body.server_info.url).toBe('chrtv.example.com');
+  });
+
+  it('accepts HTTP Basic credentials', async () => {
+    const res = await SELF.fetch(`${BASE}/player_api.php`, {
+      headers: { Authorization: `Basic ${btoa('basicuser:basicpass')}` },
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { user_info: { auth: number } }).user_info.auth).toBe(1);
+  });
+
+  it('handshakes even when the client sends no credentials in public mode', async () => {
+    const res = await SELF.fetch(`${BASE}/player_api.php`);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { user_info: { auth: number } }).user_info.auth).toBe(1);
+  });
+
+  it('advertises both m3u8 and ts output formats', async () => {
+    const res = await SELF.fetch(`${BASE}/player_api.php?username=fmt&password=fmt`);
+    const body = (await res.json()) as { user_info: { allowed_output_formats: string[] } };
+    expect(body.user_info.allowed_output_formats).toContain('m3u8');
+    expect(body.user_info.allowed_output_formats).toContain('ts');
+  });
+
+  it('an unknown action still returns a valid authenticated payload', async () => {
+    const res = await SELF.fetch(`${BASE}/player_api.php?username=u&password=p&action=get_something_new`);
+    const body = (await res.json()) as { user_info: { auth: number } };
+    expect(body.user_info.auth).toBe(1);
+  });
+
+  it('/panel_api.php returns user_info plus the channel map', async () => {
+    await seedChannels();
+    const res = await SELF.fetch(`${BASE}/panel_api.php?username=panel&password=panel`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      user_info: { auth: number };
+      available_channels: Record<string, { name: string }>;
+      categories: { live: Record<string, string> };
+    };
+    expect(body.user_info.auth).toBe(1);
+    expect(body.available_channels['100001']!.name).toBe('VTV1');
+    expect(Object.values(body.categories.live)).toContain('News');
+  });
+
   it('accepts POSTed form credentials', async () => {
     await seedUser('bob', 'password123');
     const res = await SELF.fetch(`${BASE}/player_api.php`, {
@@ -452,6 +506,60 @@ describe('HLS proxy', () => {
     expect(body).not.toContain('deadfb');
   });
 
+  it('302-redirects the player to a fallback on a port Workers cannot fetch', async () => {
+    fetchMock.get('https://deadport.example.com').intercept({ path: '/gone.m3u8' }).reply(404, 'not found');
+    const token = await mintToken('https://deadport.example.com/gone.m3u8', { channel: 'portchannel0001x' });
+    const res = await handleHlsManifest(
+      new Request(`${BASE}/hls/${token}.m3u8`),
+      { ...env, FALLBACK_M3U_URL: 'http://chrtv.duckdns.org:30113/hls/index.m3u8' },
+      'req-fallback-redirect',
+      token,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe('http://chrtv.duckdns.org:30113/hls/index.m3u8');
+    expect(res.headers.get('X-CHRTV-Fallback')).toBe('1');
+  });
+
+  it('prefers a proxyable fallback over an unfetchable-port one', async () => {
+    const fallbackManifest = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nfb2.ts\n#EXT-X-ENDLIST\n';
+    fetchMock.get('https://fb2.example.com').intercept({ path: '/hls/index.m3u8' }).reply(200, fallbackManifest);
+    fetchMock.get('https://deadmulti.example.com').intercept({ path: '/gone.m3u8' }).reply(404, 'not found');
+
+    const token = await mintToken('https://deadmulti.example.com/gone.m3u8', { channel: 'multichannel001x' });
+    const res = await handleHlsManifest(
+      new Request(`${BASE}/hls/${token}.m3u8`),
+      {
+        ...env,
+        FALLBACK_M3U_URL: 'https://fb2.example.com/hls/index.m3u8, http://chrtv.duckdns.org:30113/hls/index.m3u8',
+      },
+      'req-fallback-multi',
+      token,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get('X-CHRTV-Fallback')).toBe('1');
+    const body = await res.text();
+    expect(body).toContain(`${BASE}/seg/`);
+    expect(body).not.toContain('fb2.example.com');
+  });
+
+  it('falls through to the redirect when the proxyable fallback is dead', async () => {
+    fetchMock.get('https://fb3.example.com').intercept({ path: '/hls/index.m3u8' }).reply(500, 'boom');
+    fetchMock.get('https://deadchain.example.com').intercept({ path: '/gone.m3u8' }).reply(404, 'not found');
+
+    const token = await mintToken('https://deadchain.example.com/gone.m3u8', { channel: 'chainchannel001x' });
+    const res = await handleHlsManifest(
+      new Request(`${BASE}/hls/${token}.m3u8`),
+      {
+        ...env,
+        FALLBACK_M3U_URL: 'https://fb3.example.com/hls/index.m3u8 http://chrtv.duckdns.org:30113/hls/index.m3u8',
+      },
+      'req-fallback-chain',
+      token,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toContain(':30113');
+  });
+
   it('falls back to the empty error manifest when FALLBACK_M3U_URL is unset', async () => {
     fetchMock.get('https://deadnb.example.com').intercept({ path: '/gone.m3u8' }).reply(404, 'not found');
     const token = await mintToken('https://deadnb.example.com/gone.m3u8', { channel: 'nbchannel000001x' });
@@ -490,6 +598,22 @@ describe('HLS proxy', () => {
     expect(bad.status).toBe(401);
     const missing = await SELF.fetch(`${BASE}/live/bob/password123/999999.m3u8`);
     expect(missing.status).toBe(404);
+  });
+
+  it('the bare /{user}/{pass}/{id} form works too (portal URL without /live)', async () => {
+    await seedChannels();
+    const manifest = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\ns1.ts\n#EXT-X-ENDLIST\n';
+    fetchMock.get('https://up.example.com').intercept({ path: '/live/vtv2/index.m3u8' }).reply(200, manifest);
+    const res = await SELF.fetch(`${BASE}/bareuser/barepass/100002.m3u8`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('/seg/');
+  });
+
+  it('does not let the bare live route shadow the admin API or other routes', async () => {
+    const admin = await SELF.fetch(`${BASE}/api/admin/status`, { headers: ADMIN });
+    expect(admin.status).toBe(200);
+    const notFound = await SELF.fetch(`${BASE}/some/random/path`);
+    expect(notFound.status).toBe(404);
   });
 
   it('/live/{user}/{pass}/{id}.m3u8 redirects 302 for channels on custom ports', async () => {
