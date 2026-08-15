@@ -1,5 +1,6 @@
-import { createToken, SEGMENT_TTL, DEFAULT_MANIFEST_TTL, type TokenPayload } from '../token';
+import { createToken, SEGMENT_TTL, DEFAULT_MANIFEST_TTL, TOKEN_STABILITY_WINDOW, type TokenPayload } from '../token';
 import { isSafeUpstreamUrl } from '../utils/urlsafe';
+import { isFetchablePort } from '../utils/ports';
 
 /**
  * HLS manifest rewriter.
@@ -61,10 +62,16 @@ export interface RewriteOptions {
 
 async function tokenUrl(opts: RewriteOptions, upstream: string, kind: 'm' | 's'): Promise<string | null> {
   if (!isSafeUpstreamUrl(upstream)) return null;
+  // A URL on a port Workers cannot reach would silently hit :80/:443 and stall.
+  if (!isFetchablePort(upstream)) return null;
   const now = opts.now ?? Math.floor(Date.now() / 1000);
   const ttl = kind === 'm' ? DEFAULT_MANIFEST_TTL : SEGMENT_TTL;
-  const payload: TokenPayload = { u: upstream, iat: now, exp: now + ttl, k: kind };
-  const token = await createToken(opts.secret, payload);
+  // Quantized issue time + deterministic IV => the same upstream URI keeps the
+  // same proxied URL across manifest refreshes, so players reuse their buffer
+  // instead of re-downloading every segment (the "connection is unstable" loop).
+  const iat = Math.floor(now / TOKEN_STABILITY_WINDOW) * TOKEN_STABILITY_WINDOW;
+  const payload: TokenPayload = { u: upstream, iat, exp: iat + ttl, k: kind };
+  const token = await createToken(opts.secret, payload, `${kind}|${iat}|${upstream}`);
   if (kind === 'm') return `${opts.publicOrigin}/hls/${token}.m3u8`;
   const ext = extOf(upstream);
   return `${opts.publicOrigin}/seg/${token}${ext ? '.' + ext : ''}`;

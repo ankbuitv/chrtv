@@ -3,6 +3,7 @@ import { verifyToken } from '../token';
 import { ErrorCodes } from '../errors/codes';
 import { errorResponse, logEvent, methodNotAllowed, corsPreflight } from '../utils/http';
 import { fetchUpstream, passthroughResponse } from './upstream';
+import { isFetchablePort } from '../utils/ports';
 import { rewriteManifest, looksLikeHls, HlsError } from '../hls/rewrite';
 import { errorManifestResponse } from '../hls/errorManifest';
 import { getFailure, setFailure, recordFailure } from './failureCache';
@@ -45,8 +46,15 @@ async function failureKey(payload: { c?: string; u: string }): Promise<string> {
 async function serveFallbackManifest(env: Env, req: Request, requestId: string): Promise<Response> {
   const fallbackUrl = (env.FALLBACK_M3U_URL ?? '').trim();
   if (!fallbackUrl) return errorManifestResponse(requestId);
+  // A fallback on a port Workers cannot reach (e.g. :30113) would hang until
+  // the timeout on EVERY dead-channel request — the worst possible latency for
+  // a player that is already struggling. Skip straight to the built-in manifest.
+  if (!isFetchablePort(fallbackUrl)) {
+    logEvent(requestId, '/hls', 'FALLBACK_UNSUPPORTED_PORT', '');
+    return errorManifestResponse(requestId);
+  }
 
-  const upstream = await fetchUpstream(fallbackUrl, req, 'GET');
+  const upstream = await fetchUpstream(fallbackUrl, req, 'GET', 'manifest');
   if (!upstream.ok) {
     logEvent(requestId, '/hls', 'FALLBACK_FETCH_FAILED', upstream.code);
     return errorManifestResponse(requestId);
@@ -108,7 +116,7 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
     return serveFallbackManifest(env, req, requestId);
   }
 
-  const upstream = await fetchUpstream(payload.u, req, 'GET');
+  const upstream = await fetchUpstream(payload.u, req, 'GET', 'manifest');
   if (!upstream.ok) {
     logEvent(requestId, '/hls', upstream.code, `status=${upstream.status}`);
     await setFailure(fkey, { code: upstream.code, status: upstream.status, at: Date.now() });
@@ -167,7 +175,7 @@ export async function handleSegment(req: Request, env: Env, requestId: string, r
   }
 
   const isHead = req.method === 'HEAD';
-  const upstream = await fetchUpstream(verdict.payload.u, req, isHead ? 'HEAD' : 'GET');
+  const upstream = await fetchUpstream(verdict.payload.u, req, isHead ? 'HEAD' : 'GET', 'segment');
   if (!upstream.ok) {
     logEvent(requestId, '/seg', upstream.code, `status=${upstream.status}`);
     // Media failures return real HTTP errors; players re-request the manifest,
