@@ -18,9 +18,17 @@ import { logEvent } from '../utils/http';
  *
  * Each sweep is bounded (oldest-checked active channels first, capped at
  * MAX_PROBES_PER_RUN) so it stays inside the Workers subrequest/time budget.
- * Unknown != offline: channels on ports the Worker cannot open a subrequest to
- * (e.g. :30113) are played directly by the client, so the Worker cannot judge
- * them and marks them `unknown` instead of false-flagging them as dead.
+ *
+ * `offline` is reserved for CONFIRMED deaths only — 404/410, 5xx, timeouts,
+ * unreachable hosts, or a 200 whose body is not HLS. Everything the probe
+ * cannot conclude is `unknown`, never `offline`:
+ *  - ports the Worker cannot open a subrequest to (e.g. :30113) are played
+ *    directly by the client, so the Worker cannot judge them;
+ *  - 401/403/429/451 (auth / geo-block / rate-limit) depend on WHERE the probe
+ *    runs. Cron triggers fire on an arbitrary Cloudflare colo, possibly
+ *    outside the audience's country, so a 403 seen by the sweep proves nothing
+ *    about what viewers see. Flagging those offline is how a healthy playlist
+ *    ends up "toàn offline".
  */
 
 export type HealthStatus = 'online' | 'offline' | 'unknown';
@@ -63,12 +71,25 @@ const MAX_REDIRECTS = 3;
 const PROBE_PREFIX_BYTES = 64 * 1024;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
-/** Hard ceiling on probes per invocation — keeps us inside Workers limits. */
-export const MAX_PROBES_PER_RUN = 100;
+/**
+ * Hard ceiling on probes per invocation.
+ *
+ * Cloudflare Workers caps subrequests per invocation at 50 on the Free plan
+ * (1,000 paid). Every probe costs 1 fetch plus up to MAX_REDIRECTS more when
+ * the upstream redirects (very common: relays like devda.undo.it bounce to
+ * the real CDN). Exceeding the cap makes every fetch PAST the limit throw a
+ * plain network error — which the old code counted as "offline". A batch of
+ * 100 therefore silently flagged dozens of perfectly healthy channels offline
+ * on every sweep, until the whole playlist read "offline".
+ *
+ * 12 probes × worst-case (1 + 3) fetches = 48 subrequests < 50. Paid-plan
+ * operators may raise this safely.
+ */
+export const MAX_PROBES_PER_RUN = 12;
 /** Concurrency used inside a sweep — gentle on upstreams, caps tail latency. */
 const PROBE_CONCURRENCY = 8;
 /** Default sweep size for the periodic cron trigger. */
-export const DEFAULT_HEALTH_BATCH = 20;
+export const DEFAULT_HEALTH_BATCH = MAX_PROBES_PER_RUN;
 
 async function readPrefix(res: Response, max: number): Promise<string> {
   try {
@@ -113,7 +134,9 @@ export async function probeChannel(url: string): Promise<ProbeResult> {
         method: 'GET',
         redirect: 'manual',
         headers: {
-          'User-Agent': 'CHRTV-health/1.0',
+          // A player-flavoured UA: naive anti-leech filters reject "bot/probe/health"
+          // user agents, and the sweep should behave like a real viewer anyway.
+          'User-Agent': 'VLC/3.0.20 LibVLC/3.0.20',
           Accept: 'application/vnd.apple.mpegurl, audio/mpegurl, */*',
           'Accept-Encoding': 'identity',
         },
@@ -146,14 +169,35 @@ export async function probeChannel(url: string): Promise<ProbeResult> {
       continue;
     }
 
-    // 2xx (or 206) reached: only healthy if the body actually looks like HLS.
-    if (!res.ok && res.status !== 206) {
+    // Non-2xx reached. Only responses that PROVE the stream is gone are
+    // counted as offline; the rest is vantage-point-dependent and stays
+    // `unknown` (see module doc). A transient 5xx/timeout self-corrects on
+    // the next rotation, a false "offline" flags a healthy channel for hours.
+    if (res.status === 404 || res.status === 410) {
       try {
         await res.body?.cancel();
       } catch {
         /* ignore */
       }
-      return { status: 'offline', errorCode: classifyUpstreamStatus(res.status), httpStatus: res.status };
+      return { status: 'offline', errorCode: ErrorCodes.UPSTREAM_404, httpStatus: res.status };
+    }
+    if (res.status >= 500) {
+      try {
+        await res.body?.cancel();
+      } catch {
+        /* ignore */
+      }
+      return { status: 'offline', errorCode: ErrorCodes.UPSTREAM_5XX, httpStatus: res.status };
+    }
+    if (!res.ok && res.status !== 206) {
+      // 401/403/429/451… — auth, geo-block or rate-limit: the channel may be
+      // perfectly fine for real viewers. Report as unknown, keep the code.
+      try {
+        await res.body?.cancel();
+      } catch {
+        /* ignore */
+      }
+      return { status: 'unknown', errorCode: classifyUpstreamStatus(res.status), httpStatus: res.status };
     }
 
     const prefix = await readPrefix(res, PROBE_PREFIX_BYTES);

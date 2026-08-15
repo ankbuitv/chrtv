@@ -42,7 +42,7 @@ GitHub M3U (playlists/tv.m3u)
 - **Token**: AES-256-GCM, chứa upstream URL + iat/exp, tamper-proof, tự hết hạn. Upstream URL không bao giờ lộ ra ngoài.
 - **SSRF guard**: chỉ http/https public; chặn localhost, private IP, link-local, metadata endpoints — kiểm tra cả từng hop redirect.
 - **Circuit breaker**: upstream fail → failure state TTL 30s trong Cloudflare Cache; trong TTL trả ngay fallback manifest, hết TTL tự retry.
-- **Channel health sweep**: cron `*/10 * * * *` chủ động probe batch kênh nhỏ (ưu tiên chưa check), đánh dấu `channel_health` online/offline/unknown → lộ ra qua `/api/admin/offline` + `health_status` ở `/api/admin/channels`. Bắt cả link "200 + HTML lỗi".
+- **Channel health sweep**: cron `*/10 * * * *` chủ động probe batch kênh nhỏ (ưu tiên chưa check), đánh dấu `channel_health` online/offline/unknown → lộ ra qua `/api/admin/offline` + `health_status` ở `/api/admin/channels`. Bắt cả link "200 + HTML lỗi". `offline` chỉ khi kênh chết **chắc chắn** (404/410, 5xx, timeout, host không tới được, 200 + không phải HLS); 401/403/429/451 (auth/geo-block/rate-limit) và port không fetch được → `unknown`, không bao giờ gán offline sai.
 - **Playlist sync an toàn**: playlist mới lỗi → giữ nguyên version cũ, đánh dấu sync failed. Hash không đổi → không ghi lại DB.
 
 ## Routes
@@ -95,23 +95,35 @@ Circuit breaker ở proxy chỉ ghi lỗi khi **viewer thực sự bật** vào 
 (`stream_failures`). Một kênh hỏng link mà chưa ai xem sẽ vẫn hiện "active" trong
 playlist mãi. CHRTV bổ sung một **health sweep chủ động**:
 
-- Cron `*/10 * * * *` probe một batch nhỏ (`HEALTH_CHECK_BATCH`, mặc định 20) kênh
-  active, ưu tiên kênh **chưa được check bao giờ / lâu nhất**, xoay vòng đều.
+- Cron `*/10 * * * *` probe một batch nhỏ (hard cap **12** kênh/lần, xem giải thích
+  subrequest bên dưới) kênh active, ưu tiên kênh **chưa được check bao giờ / lâu
+  nhất**, xoay vòng đều.
 - Mỗi probe fetch upstream (cùng luật SSRF + port-safe như proxy), follow redirect,
   và **xác nhận body thật sự là HLS** — nên link "200 + HTML lỗi" cũng bị đánh
   offline, không chỉ 4xx/5xx/timeout.
-- Kênh nằm port Worker không fetch được (vd `:30113`, player tự phát trực tiếp) →
-  đánh dấu `unknown`, **không** bị tính là offline.
+- **Chỉ kết luận `offline` khi kênh chết chắc chắn**: 404/410, 5xx, timeout, host
+  không tới được, hoặc 200 + body không phải HLS. Các trường hợp phụ thuộc vị trí
+  probe — 401/403/429/451 (auth / geo-block / rate-limit), port Worker không fetch
+  được (vd `:30113`, player tự phát trực tiếp) — đánh dấu `unknown` kèm `error_code`,
+  **không** bao giờ tính là offline. Cron trigger chạy ở **colo ngẫu nhiên** của
+  Cloudflare (có thể ngoài lãnh thổ VN), nên một kênh geo-block nước ngoài vẫn
+  hoàn toàn xem được với viewer trong nước — gán offline cho nó là sai.
 - Kết quả lưu vào bảng `channel_health` (state mới nhất mỗi kênh) và lộ ra qua
   `GET /api/admin/offline`, `health_status` trong `/api/admin/channels`, và
   `health` summary trong `/api/admin/status`.
 
-Chạy sweep ngay (vd để quét toàn bộ kênh lần đầu sau deploy):
+> **Vì sao batch bị giới hạn 12 kênh?** Mỗi probe tốn 1 subrequest + tối đa 3 lần
+> follow redirect. Gói Free của Workers chỉ cho **50 subrequest mỗi invocation** —
+> vượt quá, mọi `fetch` phía sau đều ném lỗi mạng và toàn bộ kênh được quét trong
+> phần dư bị **gán offline oan**. Batch 12 × tối đa 4 fetch = 48 < 50 là an toàn.
+> Trả phí (1.000 subrequest) thì có thể nâng `MAX_PROBES_PER_RUN` lên.
+
+Chạy sweep ngay (vd để quét toàn bộ kênh lần đầu sau deploy — gọi lặp lại vài lần,
+mỗi lần quét 12 kênh tiếp theo trong vòng xoay):
 
 ```bash
-# probe tới 100 kênh trong một lần (có hard cap)
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "https://YOUR_DOMAIN/api/admin/health-check?limit=100"
+  "https://YOUR_DOMAIN/api/admin/health-check"
 ```
 
 ## Deploy
@@ -149,8 +161,9 @@ Cấu hình trong `wrangler.toml`:
   2. URL nằm trên port Worker **không** fetch được (ví dụ `:30113`) → CHRTV **302 redirect thẳng
      player** tới đó. Player trên thiết bị người dùng không bị giới hạn port nên vẫn phát bình thường.
   3. Không có URL nào dùng được → manifest "signal lost" rỗng mặc định.
-- `HEALTH_CHECK_BATCH` — (tuỳ chọn) số kênh probe mỗi cron health sweep (`*/10 * * * *`), mặc
-  định 20, hard cap 100. Càng lớn quét toàn bộ càng nhanh nhưng tốn thêm subrequest mỗi lần.
+- `HEALTH_CHECK_BATCH` — (tuỳ chọn) số kênh probe mỗi cron health sweep (`*/10 * * * *`).
+  Luôn bị clamp về hard cap 12 (subrequest budget gói Free — xem phần Channel health),
+  đặt lớn hơn cũng không quét nhanh hơn mà còn gây gán offline oan.
 
 ### ⚠️ Cổng (port) mà Cloudflare Workers fetch được
 

@@ -1,0 +1,14 @@
+-- CHRTV: reset channel health after the sweep accuracy fix
+-- Migration number: 0003
+--
+-- Sweeps before this fix could flag perfectly healthy channels offline:
+--   1. Batches above the Free-plan subrequest ceiling (50/invocation) made
+--      every fetch past the limit throw a network error, which was counted
+--      as "offline". Running `health-check?limit=100` therefore branded
+--      dozens of healthy channels offline on every pass.
+--   2. 401/403/429/451 (auth / geo-block / rate-limit) were counted as
+--      "offline" even though they depend on the colo the probe ran on
+--      (cron triggers fire on an arbitrary colo, possibly abroad).
+-- The worker now only flags CONFIRMED deaths and caps the batch at 12
+-- probes. Clear the polluted state so the corrected sweep rebuilds it.
+DELETE FROM channel_health;

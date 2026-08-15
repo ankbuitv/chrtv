@@ -123,8 +123,12 @@ export async function handleAdmin(req: Request, env: Env, requestId: string, sub
     }
     if (subPath === 'health-check') {
       if (method !== 'POST') return methodNotAllowed(['POST'], requestId);
-      // On demand an operator may sweep more channels at once (?limit=); the
-      // module caps it at MAX_PROBES_PER_RUN. Default uses the same batch as cron.
+      // On demand an operator may sweep more channels at once (?limit=), but
+      // the module caps it at MAX_PROBES_PER_RUN (12): each probe can take up
+      // to 1+3 redirect fetches, and the Free plan allows only 50 subrequests
+      // per invocation. Past the cap, fetches start failing with a network
+      // error and every channel they touch gets falsely flagged offline.
+      // Call the endpoint repeatedly to sweep the whole list.
       const requested = Number(new URL(req.url).searchParams.get('limit'));
       const limit = Number.isFinite(requested) && requested > 0 ? requested : DEFAULT_HEALTH_BATCH;
       const summary = await healthCheckBatch(env, limit);
