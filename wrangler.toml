@@ -3,10 +3,11 @@ name = "chrtv"
 main = "src/index.ts"
 compatibility_date = "2026-08-01"
 
-# Playlist auto-sync + housekeeping
+# Playlist auto-sync + channel health sweep + housekeeping
 [triggers]
 crons = [
   "*/15 * * * *", # playlist sync (skips work when hash unchanged)
+  "*/10 * * * *", # channel health sweep (bounded batch; flags dead channels as offline)
   "23 3 * * *",   # daily cleanup (old failures / sync logs / stale devices)
 ]
 
