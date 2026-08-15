@@ -13,6 +13,8 @@ export const ErrorCodes = {
   UPSTREAM_4XX: 'UPSTREAM_4XX',
   UPSTREAM_5XX: 'UPSTREAM_5XX',
   UPSTREAM_UNREACHABLE: 'UPSTREAM_UNREACHABLE',
+  /** Upstream uses a port Cloudflare Workers cannot open a subrequest to. */
+  UNSUPPORTED_PORT: 'UNSUPPORTED_PORT',
   INVALID_HLS: 'INVALID_HLS',
   UNSAFE_URL: 'UNSAFE_URL',
   DB_ERROR: 'DB_ERROR',

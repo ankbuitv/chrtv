@@ -118,11 +118,54 @@ Cấu hình trong `wrangler.toml`:
   (segment thành `/seg/{token}`) nên player phát bình thường, không lộ URL fallback. Để trống
   thì dùng manifest "signal lost" rỗng mặc định.
 
+### ⚠️ Cổng (port) mà Cloudflare Workers fetch được
+
+Worker **chỉ** mở subrequest tới các port sau; port khác bị âm thầm đổi về 80/443
+hoặc treo tới hết timeout → player báo **"connection is unstable"**:
+
+| Scheme | Port hợp lệ |
+|---|---|
+| `http:`  | 80, 8080, 8880, 2052, 2082, 2086, 2095 |
+| `https:` | 443, 8443, 2053, 2083, 2087, 2096 |
+
+CHRTV kiểm tra trước khi fetch:
+
+- URL kênh trong playlist dùng port không hợp lệ → **bị loại khi sync** (không đưa vào D1).
+- URI trong manifest dùng port không hợp lệ → **không rewrite**, không proxy.
+- `FALLBACK_M3U_URL` dùng port không hợp lệ (ví dụ `:30113`) → dùng ngay manifest
+  "signal lost" có sẵn thay vì treo timeout ở mọi request kênh chết.
+
+### Chống "connection is unstable"
+
+- **Token ổn định**: cùng một segment/kênh luôn ra cùng một URL trong cửa sổ 10 phút
+  (IV suy ra bằng HMAC thay vì random) → player tái sử dụng buffer, không tải lại
+  toàn bộ segment mỗi lần refresh manifest.
+- **Timeout tách biệt**: manifest 8s (live phải nhanh), segment 20s.
+- **Retry 1 lần** cho lỗi tạm thời (timeout / mạng / 5xx) trước khi mở circuit breaker.
+- **SEGMENT_TTL 60 phút** (trước là 15) → token không hết hạn giữa chừng khi đang xem.
+- **Không forward `accept-encoding`**, ép `identity` → body không bị giải nén lệch
+  `Content-Length` làm player thấy segment cụt.
+
+### Xtream Codes
+
+Khi `PUBLIC_PLAYLIST="true"`, client Xtream đăng nhập bằng **bất kỳ**
+username/password nào cũng được (`/get.php`, `/player_api.php`, `/live/...`),
+vì playlist vốn đã mở. Nếu username trùng user có trong D1 thì vẫn phải đúng
+mật khẩu. Đặt `PUBLIC_PLAYLIST="false"` để bắt buộc tài khoản thật.
+
+Cấu hình trong player:
+
+```
+Server / Portal URL : https://YOUR_DOMAIN     (không thêm /get.php, không thêm port)
+Username            : bất kỳ
+Password            : bất kỳ
+```
+
 ## Development & test
 
 ```bash
 npm run dev        # wrangler dev (cần .dev.vars, xem .dev.vars.example)
-npm test           # 68 tests (unit + integration, chạy trong workerd)
+npm test           # 80 tests (unit + integration, chạy trong workerd)
 npm run typecheck
 npm run build      # wrangler deploy --dry-run
 ```

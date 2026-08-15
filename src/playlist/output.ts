@@ -1,6 +1,6 @@
 import type { ChannelRow, Env } from '../types';
 import { listActiveChannels } from '../db/channels';
-import { createToken } from '../token';
+import { createToken, TOKEN_STABILITY_WINDOW } from '../token';
 import { getSetting } from '../db/settings';
 
 const DEFAULT_PLAYLIST_TOKEN_TTL = 30 * 24 * 60 * 60; // 30 days
@@ -27,8 +27,14 @@ export async function buildPlaylist(env: Env, origin: string): Promise<string> {
   const epgUrl = `${origin}/xmltv.php`;
   const lines: string[] = [`#EXTM3U url-tvg="${epgUrl}" x-tvg-url="${epgUrl}"`];
 
+  // Quantized issue time + deterministic IV: refetching the playlist yields the
+  // SAME channel URLs, so players keep their channel mapping/EPG bindings and
+  // do not restart every stream after each playlist refresh.
+  const iat = Math.floor(now / TOKEN_STABILITY_WINDOW) * TOKEN_STABILITY_WINDOW;
   const tokens = await Promise.all(
-    channels.map((ch) => createToken(env.SECRET_KEY, { u: ch.url, iat: now, exp: now + ttl, k: 'm', c: ch.id })),
+    channels.map((ch) =>
+      createToken(env.SECRET_KEY, { u: ch.url, iat, exp: iat + ttl, k: 'm', c: ch.id }, `ch|${iat}|${ch.id}|${ch.url}`),
+    ),
   );
 
   channels.forEach((ch: ChannelRow, i: number) => {

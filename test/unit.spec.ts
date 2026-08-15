@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { normalizeMac } from '../src/utils/mac';
 import { isSafeUpstreamUrl } from '../src/utils/urlsafe';
+import { isFetchablePort } from '../src/utils/ports';
 import { createToken, verifyToken } from '../src/token';
 import { parsePlaylist, PlaylistError } from '../src/playlist/parser';
 import { rewriteManifest, looksLikeHls, HlsError } from '../src/hls/rewrite';
@@ -275,5 +276,55 @@ describe('error manifest', () => {
     expect(m).toContain('#EXT-X-TARGETDURATION');
     expect(m).not.toContain('http');
     expect(m).not.toContain('<');
+  });
+});
+
+describe('Workers-fetchable ports', () => {
+  it('allows default and Cloudflare-compatible ports', () => {
+    expect(isFetchablePort('https://cdn.example.com/x.m3u8')).toBe(true);
+    expect(isFetchablePort('http://cdn.example.com/x.m3u8')).toBe(true);
+    expect(isFetchablePort('http://cdn.example.com:80/x')).toBe(true);
+    expect(isFetchablePort('http://cdn.example.com:8080/x')).toBe(true);
+    expect(isFetchablePort('https://cdn.example.com:8443/x')).toBe(true);
+    expect(isFetchablePort('https://cdn.example.com:2053/x')).toBe(true);
+  });
+  it('rejects ports a Worker subrequest cannot open', () => {
+    // These silently land on :80/:443 and stall the player.
+    expect(isFetchablePort('http://chrtv.duckdns.org:30113/hls/index.m3u8')).toBe(false);
+    expect(isFetchablePort('http://host.example.com:8989/x')).toBe(false);
+    expect(isFetchablePort('https://host.example.com:8080/x')).toBe(false); // http-only port
+    expect(isFetchablePort('http://host.example.com:8443/x')).toBe(false); // https-only port
+  });
+  it('rejects malformed URLs', () => {
+    expect(isFetchablePort('not a url')).toBe(false);
+  });
+});
+
+describe('token stability (anti re-buffering)', () => {
+  const opts = {
+    secret: SECRET,
+    baseUrl: 'https://origin.example.com/live/abc/index.m3u8',
+    publicOrigin: 'https://chrtv.example.com',
+  };
+  const manifest = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg1.ts\n#EXTINF:6.0,\nseg2.ts\n';
+
+  it('produces identical segment URLs across manifest refreshes', async () => {
+    const now = 1_800_000_000;
+    const a = await rewriteManifest(manifest, { ...opts, now });
+    const b = await rewriteManifest(manifest, { ...opts, now: now + 5 }); // player refresh
+    expect(b).toBe(a);
+  });
+
+  it('still gives different URLs to different segments', async () => {
+    const out = await rewriteManifest(manifest, { ...opts, now: 1_800_000_000 });
+    const segs = out.split('\n').filter((l) => l.includes('/seg/'));
+    expect(segs).toHaveLength(2);
+    expect(segs[0]).not.toBe(segs[1]);
+  });
+
+  it('drops URIs on ports Workers cannot fetch instead of proxying a dead URL', async () => {
+    const bad = '#EXTM3U\n#EXTINF:6.0,\nhttp://origin.example.com:30113/seg.ts\n#EXT-X-ENDLIST\n';
+    const out = await rewriteManifest(bad, opts);
+    expect(out).not.toContain('/seg/');
   });
 });

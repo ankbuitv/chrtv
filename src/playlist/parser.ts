@@ -1,5 +1,6 @@
 import { sha256Hex } from '../utils/crypto';
 import { isSafeUpstreamUrl } from '../utils/urlsafe';
+import { isFetchablePort } from '../utils/ports';
 
 export interface ParsedChannel {
   id: string;
@@ -33,6 +34,9 @@ function parseAttrs(line: string): Record<string, string> {
  * Parse + validate + normalize an M3U playlist.
  * - stable channel id = sha256(normalizedUrl|name|tvgId) prefix
  * - unsafe / non-http(s) URLs are skipped
+ * - URLs on ports a Worker subrequest cannot open are skipped too: the runtime
+ *   silently retargets them to :80/:443, so they never play and only produce
+ *   long timeouts ("connection is unstable") for whoever tunes in
  * - duplicates (same id) collapse to the first occurrence
  */
 export async function parsePlaylist(text: string): Promise<ParseResult> {
@@ -61,7 +65,7 @@ export async function parsePlaylist(text: string): Promise<ParseResult> {
     if (!pending) continue; // URL without EXTINF
     const { name, attrs } = pending;
     pending = null;
-    if (!name || !isSafeUpstreamUrl(line)) {
+    if (!name || !isSafeUpstreamUrl(line) || !isFetchablePort(line)) {
       skipped++;
       continue;
     }

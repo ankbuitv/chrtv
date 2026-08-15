@@ -1,5 +1,5 @@
-import type { Env, ChannelRow } from '../types';
-import { authenticateUser } from '../auth';
+import type { Env, ChannelRow, UserRow } from '../types';
+import { authenticateUser, type AuthResult } from '../auth';
 import { listActiveChannels, listCategories, getChannelByXtreamId } from '../db/channels';
 import { createToken, DEFAULT_MANIFEST_TTL } from '../token';
 import { buildPlaylist, playlistResponse } from '../playlist/output';
@@ -20,6 +20,44 @@ import { handleHlsManifest } from '../proxy/handlers';
  * Xtream protocol requires for client compatibility (it echoes the password
  * the client itself supplied — never another user's secret).
  */
+
+/**
+ * Xtream login.
+ *
+ * `PUBLIC_PLAYLIST=true` means "anyone may pull the playlist" — /tv.m3u already
+ * works without credentials. Xtream clients (TiviMate, Smarters, OTT Navigator)
+ * however ALWAYS send a username/password, and previously every one of them was
+ * rejected with 401 unless an operator had manually created a D1 user, which is
+ * exactly the "can't reach get.php" failure. In public mode we therefore accept
+ * any non-empty credential as a guest session; real D1 users still take
+ * precedence and a wrong password for an existing user is still rejected.
+ */
+async function authenticateXtream(env: Env, username: string, password: string): Promise<AuthResult<UserRow>> {
+  const direct = await authenticateUser(env, username, password);
+  if (direct.ok) return direct;
+
+  const publicMode = (env.PUBLIC_PLAYLIST ?? 'true').toLowerCase() !== 'false';
+  if (!publicMode) return direct;
+  if (!username || !password || username.length > 128 || password.length > 256) return direct;
+
+  // Only fall back to guest access when this username is not a registered user.
+  const existing = await env.DB.prepare('SELECT 1 AS x FROM users WHERE username = ?').bind(username).first<{ x: number }>();
+  if (existing) return direct;
+
+  const ts = Math.floor(Date.now() / 1000);
+  const guest: UserRow = {
+    id: 0,
+    username,
+    password_hash: '',
+    password_salt: '',
+    status: 'active',
+    max_connections: 4,
+    expires_at: null,
+    created_at: ts,
+    updated_at: ts,
+  };
+  return { ok: true, value: guest };
+}
 
 function xtreamUserInfo(username: string, password: string, expiresAt: number | null, maxConnections: number) {
   return {
@@ -88,7 +126,7 @@ export async function handlePlayerApi(req: Request, env: Env, requestId: string)
   const username = params.get('username') ?? '';
   const password = params.get('password') ?? '';
 
-  const auth = await authenticateUser(env, username, password);
+  const auth = await authenticateXtream(env, username, password);
   if (!auth.ok) {
     logEvent(requestId, '/player_api.php', auth.code);
     // Xtream clients expect a 200 + auth:0 body on bad credentials.
@@ -127,7 +165,7 @@ export async function handlePlayerApi(req: Request, env: Env, requestId: string)
 /** /get.php?username=..&password=..&type=m3u_plus — full M3U download. */
 export async function handleGetPhp(req: Request, env: Env, requestId: string): Promise<Response> {
   const url = new URL(req.url);
-  const auth = await authenticateUser(env, url.searchParams.get('username') ?? '', url.searchParams.get('password') ?? '');
+  const auth = await authenticateXtream(env, url.searchParams.get('username') ?? '', url.searchParams.get('password') ?? '');
   if (!auth.ok) {
     logEvent(requestId, '/get.php', auth.code);
     return errorResponse(auth.code, auth.status, requestId);
@@ -153,7 +191,7 @@ export async function handleXtreamLive(
   } catch {
     /* keep raw values on malformed percent-encoding */
   }
-  const auth = await authenticateUser(env, user, pass);
+  const auth = await authenticateXtream(env, user, pass);
   if (!auth.ok) {
     logEvent(requestId, '/live', auth.code);
     return errorResponse(auth.code, auth.status, requestId);

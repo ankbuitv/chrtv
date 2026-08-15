@@ -263,6 +263,28 @@ describe('Xtream Codes API', () => {
     expect(text).not.toContain('up.example.com');
   });
 
+  it('get.php works for a fresh Xtream client in public mode (no pre-created user)', async () => {
+    await seedChannels();
+    const res = await SELF.fetch(`${BASE}/get.php?username=anyuser&password=anypass&type=m3u_plus&output=m3u8`);
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('#EXTM3U');
+    expect(text).toContain('VTV1');
+    expect(text).not.toContain('up.example.com');
+  });
+
+  it('player_api handshake succeeds for a guest in public mode', async () => {
+    const res = await SELF.fetch(`${BASE}/player_api.php?username=guest1&password=guest1`);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { user_info: { auth: number } }).user_info.auth).toBe(1);
+  });
+
+  it('a wrong password for an EXISTING user is still rejected', async () => {
+    await seedUser('bob', 'password123');
+    const res = await SELF.fetch(`${BASE}/get.php?username=bob&password=totally-wrong`);
+    expect(res.status).toBe(401);
+  });
+
   it('/player-api.php alias works', async () => {
     await seedUser('bob', 'password123');
     const res = await SELF.fetch(`${BASE}/player-api.php?username=bob&password=password123`);
