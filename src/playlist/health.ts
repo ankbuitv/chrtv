@@ -19,9 +19,16 @@ import { logEvent } from '../utils/http';
  * Each sweep is bounded (oldest-checked active channels first, capped at
  * MAX_PROBES_PER_RUN) so it stays inside the Workers subrequest/time budget.
  *
- * `offline` is reserved for CONFIRMED deaths only — 404/410, 5xx, timeouts,
- * unreachable hosts, or a 200 whose body is not HLS. Everything the probe
- * cannot conclude is `unknown`, never `offline`:
+ * `offline` is reserved for links that genuinely CANNOT BE REACHED — and only
+ * after OFFLINE_CONFIRMATIONS consecutive probes agree:
+ *  - the host is unreachable (connection refused / DNS dead);
+ *  - the upstream stays silent past the 30s probe timeout;
+ *  - 404/410 — the link itself is gone.
+ * Everything else means the link IS reachable, so it is `unknown`, never
+ * `offline`:
+ *  - 5xx: the server answered — it is having a moment, not a dead link;
+ *  - 200 + non-HLS body: reachable, just serving something odd (often an
+ *    anti-bot interstitial shown to the probe while real players stream fine);
  *  - ports the Worker cannot open a subrequest to (e.g. :30113) are played
  *    directly by the client, so the Worker cannot judge them;
  *  - 401/403/429/451 (auth / geo-block / rate-limit) depend on WHERE the probe
@@ -29,6 +36,10 @@ import { logEvent } from '../utils/http';
  *    outside the audience's country, so a 403 seen by the sweep proves nothing
  *    about what viewers see. Flagging those offline is how a healthy playlist
  *    ends up "toàn offline".
+ * A single unreachable probe can still be a network blip at the probing colo,
+ * so the sweep keeps a per-channel `fail_streak`: the first unreachable result
+ * records `unknown` (streak 1), and only a second consecutive one flips the
+ * channel to `offline`. Any success or inconclusive probe resets the streak.
  */
 
 export type HealthStatus = 'online' | 'offline' | 'unknown';
@@ -81,6 +92,16 @@ const PROBE_PREFIX_BYTES = 64 * 1024;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 /**
+ * Consecutive "unreachable" probes required before a channel is flagged
+ * offline. One failed probe can be a network blip at whichever Cloudflare
+ * colo the cron happened to run on; requiring a second consecutive failure
+ * (next rotation, likely a different moment/colo) keeps healthy channels from
+ * flickering offline. The first failure is stored as `unknown` with the
+ * error code preserved, so the admin can still see it is suspect.
+ */
+export const OFFLINE_CONFIRMATIONS = 2;
+
+/**
  * Hard ceiling on probes per invocation.
  *
  * Cloudflare Workers caps subrequests per invocation at 50 on the Free plan
@@ -131,19 +152,32 @@ async function readPrefix(res: Response, max: number): Promise<string> {
 
 /**
  * Probe a single upstream URL and classify its health.
- * Reuses the proxy's SSRF + port-safety checks at every hop, follows redirects
- * manually, and — crucially — confirms a 2xx body actually looks like HLS so a
- * "200 + HTML error page" broken link is correctly flagged offline.
+ * Reuses the proxy's SSRF + port-safety checks at every hop and follows
+ * redirects manually inside ONE shared 30s budget (not 30s per hop).
+ *
+ * The returned `offline` is the RAW per-probe verdict "this link could not be
+ * reached at all": host unreachable, silent past the timeout, or 404/410.
+ * Anything the probe could reach — 5xx, auth/geo blocks, even a 200 whose
+ * body is not HLS (often an anti-bot page shown only to the probe) — is
+ * `unknown`, because the link itself IS accessible. The sweep additionally
+ * requires OFFLINE_CONFIRMATIONS consecutive raw-offline probes before a
+ * channel is actually persisted as offline.
  */
 export async function probeChannel(url: string): Promise<ProbeResult> {
   if (!isSafeUpstreamUrl(url)) return { status: 'unknown', errorCode: ErrorCodes.UNSAFE_URL, httpStatus: 0 };
   if (!isFetchablePort(url)) return { status: 'unknown', errorCode: ErrorCodes.UNSUPPORTED_PORT, httpStatus: 0 };
 
+  // One shared wall-clock budget for the WHOLE redirect chain. Per-hop
+  // timeouts let a malicious/broken chain stretch a single probe to
+  // hops × 30s, starving the rest of the sweep.
+  const deadline = Date.now() + PROBE_TIMEOUT_MS;
   let currentUrl = url;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     if (!isSafeUpstreamUrl(currentUrl) || !isFetchablePort(currentUrl)) {
       return { status: 'unknown', errorCode: ErrorCodes.UNSUPPORTED_PORT, httpStatus: 0 };
     }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { status: 'offline', errorCode: ErrorCodes.UPSTREAM_TIMEOUT, httpStatus: 0 };
     let res: Response;
     try {
       res = await fetch(currentUrl, {
@@ -156,7 +190,7 @@ export async function probeChannel(url: string): Promise<ProbeResult> {
           Accept: 'application/vnd.apple.mpegurl, audio/mpegurl, */*',
           'Accept-Encoding': 'identity',
         },
-        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+        signal: AbortSignal.timeout(remaining),
       });
     } catch (err) {
       const timedOut = err instanceof DOMException && err.name === 'TimeoutError';
@@ -175,20 +209,21 @@ export async function probeChannel(url: string): Promise<ProbeResult> {
         /* ignore */
       }
       if (!location || hop === MAX_REDIRECTS) {
-        return { status: 'offline', errorCode: ErrorCodes.UPSTREAM_UNREACHABLE, httpStatus: res.status };
+        // The server answered (with a broken/looping redirect) — reachable,
+        // just misbehaving. Not proof the link is dead.
+        return { status: 'unknown', errorCode: ErrorCodes.UPSTREAM_UNREACHABLE, httpStatus: res.status };
       }
       try {
         currentUrl = new URL(location, currentUrl).toString();
       } catch {
-        return { status: 'offline', errorCode: ErrorCodes.UPSTREAM_UNREACHABLE, httpStatus: res.status };
+        return { status: 'unknown', errorCode: ErrorCodes.UPSTREAM_UNREACHABLE, httpStatus: res.status };
       }
       continue;
     }
 
-    // Non-2xx reached. Only responses that PROVE the stream is gone are
-    // counted as offline; the rest is vantage-point-dependent and stays
-    // `unknown` (see module doc). A transient 5xx/timeout self-corrects on
-    // the next rotation, a false "offline" flags a healthy channel for hours.
+    // A response arrived => the link IS reachable. From here only 404/410
+    // ("this link no longer exists") still counts as a dead link; every
+    // other answer — 5xx hiccup, auth/geo block, rate limit — is `unknown`.
     if (res.status === 404 || res.status === 410) {
       try {
         await res.body?.cancel();
@@ -197,17 +232,10 @@ export async function probeChannel(url: string): Promise<ProbeResult> {
       }
       return { status: 'offline', errorCode: ErrorCodes.UPSTREAM_404, httpStatus: res.status };
     }
-    if (res.status >= 500) {
-      try {
-        await res.body?.cancel();
-      } catch {
-        /* ignore */
-      }
-      return { status: 'offline', errorCode: ErrorCodes.UPSTREAM_5XX, httpStatus: res.status };
-    }
     if (!res.ok && res.status !== 206) {
-      // 401/403/429/451… — auth, geo-block or rate-limit: the channel may be
-      // perfectly fine for real viewers. Report as unknown, keep the code.
+      // 5xx / 401/403/429/451… — the server responded, so the link is not
+      // dead. 5xx self-corrects (restart/overload); the 4xx family depends on
+      // WHERE the probe runs. Report as unknown, keep the code for the admin.
       try {
         await res.body?.cancel();
       } catch {
@@ -217,11 +245,14 @@ export async function probeChannel(url: string): Promise<ProbeResult> {
     }
 
     const prefix = await readPrefix(res, PROBE_PREFIX_BYTES);
+    // 200 + non-HLS body: reachable but serving something odd — frequently an
+    // anti-bot/interstitial page that only the datacenter probe sees while
+    // real players stream fine. Suspicious, but NOT "link không vô được".
     return looksLikeHls(prefix)
       ? { status: 'online', errorCode: '', httpStatus: res.status }
-      : { status: 'offline', errorCode: ErrorCodes.INVALID_HLS, httpStatus: res.status };
+      : { status: 'unknown', errorCode: ErrorCodes.INVALID_HLS, httpStatus: res.status };
   }
-  return { status: 'offline', errorCode: ErrorCodes.UPSTREAM_UNREACHABLE, httpStatus: 0 };
+  return { status: 'unknown', errorCode: ErrorCodes.UPSTREAM_UNREACHABLE, httpStatus: 0 };
 }
 
 async function mapWithConcurrency<T, R>(
@@ -250,7 +281,7 @@ export async function healthCheckBatch(env: Env, limit: number): Promise<HealthC
   const cap = Math.max(1, Math.min(limit, MAX_PROBES_PER_RUN));
   const { results } = await env.DB
     .prepare(
-      `SELECT c.id, c.url
+      `SELECT c.id, c.url, COALESCE(h.fail_streak, 0) AS fail_streak
          FROM channels c
          LEFT JOIN channel_health h ON h.channel_id = c.id
         WHERE c.active = 1 AND c.url != ''
@@ -258,11 +289,18 @@ export async function healthCheckBatch(env: Env, limit: number): Promise<HealthC
         LIMIT ?`,
     )
     .bind(cap)
-    .all<{ id: string; url: string }>();
+    .all<{ id: string; url: string; fail_streak: number }>();
 
   const now = Math.floor(Date.now() / 1000);
   const probed = await mapWithConcurrency(results, PROBE_CONCURRENCY, async (ch) => {
-    const r = { id: ch.id, ...(await probeChannel(ch.url)) };
+    const raw = await probeChannel(ch.url);
+    // Confirmation gate: a channel only goes `offline` after
+    // OFFLINE_CONFIRMATIONS consecutive unreachable probes. The first failed
+    // probe is persisted as `unknown` (with the error code kept for the
+    // admin) so one bad network moment never flags a watchable channel.
+    const streak = raw.status === 'offline' ? (ch.fail_streak ?? 0) + 1 : 0;
+    const status: HealthStatus = raw.status === 'offline' && streak < OFFLINE_CONFIRMATIONS ? 'unknown' : raw.status;
+    const r = { id: ch.id, status, errorCode: raw.errorCode, httpStatus: raw.httpStatus, streak };
     // Persist each result the moment it lands instead of one batch write at
     // the end: with a 30s probe timeout, a sweep full of dead upstreams can
     // brush against the cron wall-clock limit, and a final write would lose
@@ -271,15 +309,16 @@ export async function healthCheckBatch(env: Env, limit: number): Promise<HealthC
     try {
       await env.DB
         .prepare(
-          `INSERT INTO channel_health (channel_id, status, error_code, http_status, checked_at)
-           VALUES (?, ?, ?, ?, ?)
+          `INSERT INTO channel_health (channel_id, status, error_code, http_status, checked_at, fail_streak)
+           VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(channel_id) DO UPDATE SET
              status = excluded.status,
              error_code = excluded.error_code,
              http_status = excluded.http_status,
-             checked_at = excluded.checked_at`,
+             checked_at = excluded.checked_at,
+             fail_streak = excluded.fail_streak`,
         )
-        .bind(r.id, r.status, r.errorCode, r.httpStatus, now)
+        .bind(r.id, r.status, r.errorCode, r.httpStatus, now, r.streak)
         .run();
     } catch {
       /* health persistence must never break the sweep — next rotation retries */

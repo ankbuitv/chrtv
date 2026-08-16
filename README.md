@@ -42,7 +42,7 @@ GitHub M3U (playlists/tv.m3u)
 - **Token**: AES-256-GCM, chứa upstream URL + iat/exp, tamper-proof, tự hết hạn. Upstream URL không bao giờ lộ ra ngoài.
 - **SSRF guard**: chỉ http/https public; chặn localhost, private IP, link-local, metadata endpoints — kiểm tra cả từng hop redirect.
 - **Circuit breaker**: upstream fail → failure state TTL 30s trong Cloudflare Cache; trong TTL trả ngay fallback manifest, hết TTL tự retry.
-- **Channel health sweep**: cron `*/10 * * * *` chủ động probe batch kênh nhỏ (ưu tiên chưa check), đánh dấu `channel_health` online/offline/unknown → lộ ra qua `/api/admin/offline` + `health_status` ở `/api/admin/channels`. Bắt cả link "200 + HTML lỗi". `offline` chỉ khi kênh chết **chắc chắn** (404/410, 5xx, **im lặng quá 30s**, host không tới được, 200 + không phải HLS); 401/403/429/451 (auth/geo-block/rate-limit) và port không fetch được → `unknown`, không bao giờ gán offline sai.
+- **Channel health sweep**: cron `*/10 * * * *` chủ động probe batch kênh nhỏ (ưu tiên chưa check), đánh dấu `channel_health` online/offline/unknown → lộ ra qua `/api/admin/offline` + `health_status` ở `/api/admin/channels`. `offline` **chỉ khi link thật sự không vô được** (host không tới được, **im lặng quá 30s**, 404/410) và phải fail như vậy **2 lượt probe liên tiếp** mới chốt. Mọi trường hợp server vẫn trả lời — 5xx, 401/403/429/451 (auth/geo-block/rate-limit), 200 + body không phải HLS (trang anti-bot), port Worker không fetch được — đều là `unknown`, không bao giờ gán offline sai.
 - **Playlist sync an toàn**: playlist mới lỗi → giữ nguyên version cũ, đánh dấu sync failed. Hash không đổi → không ghi lại DB.
 
 ## Routes
@@ -98,21 +98,27 @@ playlist mãi. CHRTV bổ sung một **health sweep chủ động**:
 - Cron `*/10 * * * *` probe một batch nhỏ (hard cap **12** kênh/lần, xem giải thích
   subrequest bên dưới) kênh active, ưu tiên kênh **chưa được check bao giờ / lâu
   nhất**, xoay vòng đều.
-- Mỗi probe fetch upstream (cùng luật SSRF + port-safe như proxy), follow redirect,
-  và **xác nhận body thật sự là HLS** — nên link "200 + HTML lỗi" cũng bị đánh
-  offline, không chỉ 4xx/5xx/timeout.
-- **Probe chờ tới 30s** (mỗi hop redirect) trước khi kết luận timeout: relay chậm
-  kiểu devda.undo.it bounce qua CDN mất 10-25s mới ra byte đầu — load lâu nhưng
-  vẫn phát bình thường. Timeout ngắn (6-8s) gán offline oan cho mấy kênh này
-  mỗi lần quét.
-- **Chỉ kết luận `offline` khi kênh chết chắc chắn**: 404/410, 5xx, im lặng quá
-  30s, host không tới được, hoặc 200 + body không phải HLS. Các trường hợp phụ
-  thuộc vị trí
-  probe — 401/403/429/451 (auth / geo-block / rate-limit), port Worker không fetch
-  được (vd `:30113`, player tự phát trực tiếp) — đánh dấu `unknown` kèm `error_code`,
+- Mỗi probe fetch upstream (cùng luật SSRF + port-safe như proxy), follow redirect
+  và xác nhận body có phải HLS không.
+- **Probe chờ tới 30s** (tổng ngân sách cho cả chuỗi redirect) trước khi kết luận
+  timeout: relay chậm kiểu devda.undo.it bounce qua CDN mất 10-25s mới ra byte
+  đầu — load lâu nhưng vẫn phát bình thường. Timeout ngắn (6-8s) gán offline oan
+  cho mấy kênh này mỗi lần quét.
+- **`offline` chỉ dành cho link thật sự KHÔNG VÔ ĐƯỢC**: host không tới được
+  (DNS chết / connection refused), im lặng quá 30s, hoặc 404/410 (link không còn
+  tồn tại). Server còn trả lời được — dù là 5xx (đang quá tải / restart),
+  401/403/429/451 (auth / geo-block / rate-limit), hay 200 + body không phải HLS
+  (thường là trang anti-bot chỉ hiện với probe datacenter, player thật vẫn xem
+  được) — nghĩa là link **vẫn vô được**, đánh dấu `unknown` kèm `error_code`,
   **không** bao giờ tính là offline. Cron trigger chạy ở **colo ngẫu nhiên** của
   Cloudflare (có thể ngoài lãnh thổ VN), nên một kênh geo-block nước ngoài vẫn
   hoàn toàn xem được với viewer trong nước — gán offline cho nó là sai.
+- **Phải fail 2 lượt probe liên tiếp mới chốt offline** (`fail_streak` trong
+  `channel_health`): một lần fail có thể chỉ là một nhịp mạng xấu ở colo chạy
+  cron. Lần fail đầu ghi `unknown` (vẫn giữ `error_code` để admin thấy kênh đáng
+  ngờ); lần thứ hai liên tiếp mới flip sang `offline`. Probe thành công hoặc
+  không kết luận được → reset streak về 0, nên kênh chập chờn không bao giờ bị
+  báo offline oan.
 - Kết quả lưu vào bảng `channel_health` (state mới nhất mỗi kênh) và lộ ra qua
   `GET /api/admin/offline`, `health_status` trong `/api/admin/channels`, và
   `health` summary trong `/api/admin/status`.
@@ -196,9 +202,20 @@ CHRTV kiểm tra trước khi fetch:
 - **Timeout 30s cho cả manifest lẫn segment**: relay chậm (devda.undo.it → CDN)
   load 10-25s vẫn vào kênh bình thường — chỉ khi upstream **im lặng quá 30s** mới
   tính chết, mở circuit breaker và bật fallback.
-- **Retry 1 lần** cho lỗi tạm thởi fail nhanh (mạng / 5xx) trước khi mở circuit
-  breaker. Timeout 30s đã là kết luận đủ chắc nên **không retry** (tránh kéo
-  dài 60s trước khi player nhận được fallback).
+- **30s là TỔNG ngân sách chờ, không phải mỗi hop**: deadline chia sẻ cho toàn bộ
+  chuỗi redirect + cả lần retry. Trước đây mỗi hop redirect được cấp lại 30s mới,
+  chuỗi 6 hop chậm có thể bắt player nhìn spinner tới ~3 phút ("load video quá
+  lâu") mới thấy fallback — giờ tệ nhất cũng chỉ ~30s đúng như policy.
+- **Cache segment 30s trên edge Cloudflare**: segment live là bất biến sau khi
+  publish, và token segment là deterministic nên cùng một segment luôn ra cùng
+  một URL. Chỉ request ĐẦU TIÊN phải chịu TTFB 10-25s của relay chậm; player
+  retry / viewer thứ hai / nhánh ABR lấy lại segment đó nhận ngay từ cache —
+  giảm hẳn cảnh "load video quá lâu" khi nhiều người cùng xem. Manifest không
+  cache (playlist live đổi liên tục), Range request đi thẳng upstream.
+- **Retry 1 lần** cho lỗi tạm thời fail nhanh (mạng / 5xx) trước khi mở circuit
+  breaker — nhưng chỉ với phần thời gian còn lại của ngân sách 30s. Timeout đã
+  là kết luận đủ chắc nên **không retry** (tránh kéo dài 60s trước khi player
+  nhận được fallback).
 - **SEGMENT_TTL 60 phút** (trước là 15) → token không hết hạn giữa chừng khi đang xem.
 - **Không forward `accept-encoding`**, ép `identity` → body không bị giải nén lệch
   `Content-Length` làm player thấy segment cụt.

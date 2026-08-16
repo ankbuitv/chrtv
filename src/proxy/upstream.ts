@@ -11,9 +11,30 @@ import { ErrorCodes, type ErrorCode } from '../errors/codes';
  * Kept as two constants so operators can still tune manifest vs segment
  * separately, but both default to the same 30s ceiling. (Player-side fetch
  * waits don't count against Workers CPU time, only wall clock.)
+ *
+ * IMPORTANT: this is a TOTAL wall-clock budget for the whole request —
+ * shared across every redirect hop AND the transient-failure retry. The old
+ * code armed a fresh 30s timer per hop, so a slow 6-hop redirect chain could
+ * keep a player staring at a spinner for up to ~3 minutes ("load video quá
+ * lâu") before the fallback ever appeared. Now the player waits at most ~30s
+ * worst case, same as the declared policy.
  */
 const MANIFEST_TIMEOUT_MS = 30_000;
 const SEGMENT_TIMEOUT_MS = 30_000;
+
+/**
+ * Edge-cache TTL for media segments (seconds).
+ * Live HLS segments are immutable once published, and the deterministic
+ * segment tokens keep the same /seg/ URL across manifest refreshes — so the
+ * SAME upstream segment is requested over and over (player retries, multiple
+ * viewers, ABR ladder switches). Caching them on the Cloudflare edge means
+ * only the FIRST request pays the slow-relay TTFB; everyone else gets the
+ * segment instantly instead of re-suffering a 10-25s upstream each time.
+ * Kept short: segments only need to live as long as they stay in the live
+ * window. Range requests bypass this (see fetchOnce) — CF handles ranges over
+ * a cached object itself, but a range-initiated MISS must not poison the key.
+ */
+const SEGMENT_CACHE_TTL_SECONDS = 30;
 
 /**
  * Request headers forwarded to the upstream. Auth/cookies are never forwarded.
@@ -64,7 +85,8 @@ async function fetchOnce(
   url: string,
   clientReq: Request,
   method: 'GET' | 'HEAD',
-  timeoutMs: number,
+  deadline: number,
+  kind: UpstreamKind,
 ): Promise<UpstreamResult> {
   const headers = new Headers();
   for (const h of FORWARD_REQUEST_HEADERS) {
@@ -73,6 +95,15 @@ async function fetchOnce(
   }
   headers.set('Accept-Encoding', 'identity');
   headers.set('User-Agent', clientReq.headers.get('user-agent') ?? 'CHRTV/1.0');
+
+  // Segments are edge-cached so repeat hits skip the slow upstream entirely.
+  // Manifests must stay uncached (live playlists change every few seconds),
+  // and Range requests are excluded so a partial response can never be cached
+  // under the full-object key.
+  const cacheSegments = kind === 'segment' && method === 'GET' && !headers.has('range');
+  const cf: RequestInitCfProperties | undefined = cacheSegments
+    ? { cacheEverything: true, cacheTtl: SEGMENT_CACHE_TTL_SECONDS }
+    : undefined;
 
   let currentUrl = url;
   let currentMethod = method;
@@ -83,13 +114,19 @@ async function fetchOnce(
     // unreachable port silently lands on :80/:443 or hangs until the timeout.
     if (!isFetchablePort(currentUrl)) return { ok: false, code: ErrorCodes.UNSUPPORTED_PORT, status: 0 };
 
+    // Shared budget across the whole redirect chain — never a fresh timer per
+    // hop, so the player is never left waiting longer than the 30s policy.
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { ok: false, code: ErrorCodes.UPSTREAM_TIMEOUT, status: 0 };
+
     let res: Response;
     try {
       res = await fetch(currentUrl, {
         method: currentMethod,
         headers,
         redirect: 'manual',
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(remaining),
+        ...(cf ? { cf } : {}),
       });
     } catch (err) {
       const timedOut = err instanceof DOMException && err.name === 'TimeoutError';
@@ -125,8 +162,9 @@ async function fetchOnce(
  * - validates URL safety + port reachability immediately before fetching
  * - follows redirects MANUALLY (max 5 hops) so every hop is checked and
  *   `finalUrl` is deterministic for relative URI resolution
- * - retries once on a fast transient failure (network / 5xx); a 30s timeout
- *   is conclusive and is never retried
+ * - retries once on a fast transient failure (network / 5xx) — but only with
+ *   whatever is LEFT of the shared 30s budget; a timeout is conclusive and is
+ *   never retried
  * - never forwards client cookies/authorization headers upstream
  */
 export async function fetchUpstream(
@@ -136,9 +174,13 @@ export async function fetchUpstream(
   kind: UpstreamKind = 'manifest',
 ): Promise<UpstreamResult> {
   const timeoutMs = kind === 'manifest' ? MANIFEST_TIMEOUT_MS : SEGMENT_TIMEOUT_MS;
-  const first = await fetchOnce(url, clientReq, method, timeoutMs);
+  // One deadline for everything: redirects AND the retry share it, so total
+  // player-facing wait can never exceed the policy timeout.
+  const deadline = Date.now() + timeoutMs;
+  const first = await fetchOnce(url, clientReq, method, deadline, kind);
   if (first.ok || !isRetryable(first.code)) return first;
-  return fetchOnce(url, clientReq, method, timeoutMs);
+  if (deadline - Date.now() <= 0) return first;
+  return fetchOnce(url, clientReq, method, deadline, kind);
 }
 
 /** Build a passthrough media response — the body is streamed, never buffered. */

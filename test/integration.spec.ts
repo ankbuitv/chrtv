@@ -813,16 +813,16 @@ describe('channel health probe', () => {
     expect(r).toMatchObject({ status: 'offline', errorCode: 'UPSTREAM_404', httpStatus: 404 });
   });
 
-  it('flags a 200 + HTML body as offline (broken link hiding behind a 200)', async () => {
+  it('keeps a 200 + HTML body as unknown — the link IS reachable, just serving non-HLS (anti-bot page)', async () => {
     fetchMock.get('https://hprobe.example.com').intercept({ path: '/html.m3u8' }).reply(200, '<html><body>down</body></html>');
     const r = await probeChannel('https://hprobe.example.com/html.m3u8');
-    expect(r).toMatchObject({ status: 'offline', errorCode: 'INVALID_HLS', httpStatus: 200 });
+    expect(r).toMatchObject({ status: 'unknown', errorCode: 'INVALID_HLS', httpStatus: 200 });
   });
 
-  it('flags a 5xx upstream as offline', async () => {
+  it('keeps a 5xx upstream as unknown — the server answered, the link is not dead', async () => {
     fetchMock.get('https://hprobe.example.com').intercept({ path: '/500.m3u8' }).reply(500, 'boom');
     const r = await probeChannel('https://hprobe.example.com/500.m3u8');
-    expect(r).toMatchObject({ status: 'offline', errorCode: 'UPSTREAM_5XX', httpStatus: 500 });
+    expect(r).toMatchObject({ status: 'unknown', errorCode: 'UPSTREAM_5XX', httpStatus: 500 });
   });
 
   it('keeps a 403 (auth/geo-block) as unknown — the probe vantage cannot judge it', async () => {
@@ -899,23 +899,64 @@ describe('health-check sweep', () => {
     ]);
   }
 
-  it('probes a batch and records per-channel health', async () => {
+  it('probes a batch and records per-channel health — offline only after 2 consecutive unreachable probes', async () => {
     await seedSweepChannels();
     const origin = fetchMock.get('https://hsweep.example.com');
-    origin.intercept({ path: '/online.m3u8' }).reply(200, HLS_OK);
-    origin.intercept({ path: '/dead.m3u8' }).reply(404, 'x');
-    origin.intercept({ path: '/html.m3u8' }).reply(200, '<html>down</html>');
+    origin.intercept({ path: '/online.m3u8' }).reply(200, HLS_OK).persist();
+    origin.intercept({ path: '/dead.m3u8' }).reply(404, 'x').persist();
+    origin.intercept({ path: '/html.m3u8' }).reply(200, '<html>down</html>').persist();
 
+    // Sweep 1: the dead link fails once => still `unknown` (needs confirmation);
+    // the HTML link is reachable => `unknown` too, never offline.
+    const first = await healthCheckBatch(env, 10);
+    expect(first).toEqual({ checked: 3, online: 1, offline: 0, unknown: 2 });
+
+    let rows = await env.DB
+      .prepare("SELECT channel_id, status, error_code, fail_streak FROM channel_health WHERE channel_id LIKE 'cafebabe%' ORDER BY channel_id")
+      .all<{ channel_id: string; status: string; error_code: string; fail_streak: number }>();
+    let byId = Object.fromEntries(rows.results.map((r) => [r.channel_id, r]));
+    expect(byId['cafebabe00000001']).toMatchObject({ status: 'online', fail_streak: 0 });
+    expect(byId['cafebabe00000002']).toMatchObject({ status: 'unknown', error_code: 'UPSTREAM_404', fail_streak: 1 });
+    expect(byId['cafebabe00000003']).toMatchObject({ status: 'unknown', error_code: 'INVALID_HLS', fail_streak: 0 });
+
+    // Sweep 2: the dead link fails a second consecutive time => confirmed offline.
+    const second = await healthCheckBatch(env, 10);
+    expect(second).toEqual({ checked: 3, online: 1, offline: 1, unknown: 1 });
+
+    rows = await env.DB
+      .prepare("SELECT channel_id, status, error_code, fail_streak FROM channel_health WHERE channel_id LIKE 'cafebabe%' ORDER BY channel_id")
+      .all<{ channel_id: string; status: string; error_code: string; fail_streak: number }>();
+    byId = Object.fromEntries(rows.results.map((r) => [r.channel_id, r]));
+    expect(byId['cafebabe00000002']).toMatchObject({ status: 'offline', error_code: 'UPSTREAM_404', fail_streak: 2 });
+    expect(byId['cafebabe00000003']).toMatchObject({ status: 'unknown', error_code: 'INVALID_HLS' });
+  });
+
+  it('a recovery between failures resets the streak — flapping never reaches offline', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await resetChannels();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+         VALUES ('cafebabe00000042', 200042, 'H-Flap', 'https://hflap.example.com/ch.m3u8', '', '', 1, 0, 1, 9, ?, ?)`,
+      ).bind(now, now),
+    ]);
+    const origin = fetchMock.get('https://hflap.example.com');
+
+    // fail (streak 1 → unknown)
+    origin.intercept({ path: '/ch.m3u8' }).reply(404, 'x');
+    await healthCheckBatch(env, 10);
+    // recover (streak reset)
+    origin.intercept({ path: '/ch.m3u8' }).reply(200, HLS_OK);
+    await healthCheckBatch(env, 10);
+    // fail again (streak back to 1 → still unknown, NOT offline)
+    origin.intercept({ path: '/ch.m3u8' }).reply(404, 'x');
     const summary = await healthCheckBatch(env, 10);
-    expect(summary).toEqual({ checked: 3, online: 1, offline: 2, unknown: 0 });
+    expect(summary.offline).toBe(0);
 
-    const rows = await env.DB
-      .prepare("SELECT channel_id, status, error_code FROM channel_health WHERE channel_id LIKE 'cafebabe%' ORDER BY channel_id")
-      .all<{ channel_id: string; status: string; error_code: string }>();
-    const byId = Object.fromEntries(rows.results.map((r) => [r.channel_id, r]));
-    expect(byId['cafebabe00000001']).toMatchObject({ status: 'online' });
-    expect(byId['cafebabe00000002']).toMatchObject({ status: 'offline', error_code: 'UPSTREAM_404' });
-    expect(byId['cafebabe00000003']).toMatchObject({ status: 'offline', error_code: 'INVALID_HLS' });
+    const row = await env.DB
+      .prepare("SELECT status, fail_streak FROM channel_health WHERE channel_id = 'cafebabe00000042'")
+      .first<{ status: string; fail_streak: number }>();
+    expect(row).toMatchObject({ status: 'unknown', fail_streak: 1 });
   });
 
   it('sweeps the oldest-checked channels first (never-checked beats recently checked)', async () => {
@@ -1043,9 +1084,17 @@ describe('admin health visibility', () => {
       ).bind(now, now),
     ]);
     const origin = fetchMock.get('https://hc.example.com');
-    origin.intercept({ path: '/live.m3u8' }).reply(200, HLS_OK);
-    origin.intercept({ path: '/dead.m3u8' }).reply(500, 'boom');
+    origin.intercept({ path: '/live.m3u8' }).reply(200, HLS_OK).persist();
+    // 404 = the link itself is gone (a 5xx would only be `unknown` now).
+    origin.intercept({ path: '/dead.m3u8' }).reply(404, 'gone').persist();
 
+    // First sweep: dead link is only suspect (unknown, streak 1).
+    const first = await SELF.fetch(`${BASE}/api/admin/health-check`, { method: 'POST', headers: ADMIN });
+    expect(first.status).toBe(200);
+    const s1 = (await first.json()) as { checked: number; online: number; offline: number; unknown: number };
+    expect(s1).toMatchObject({ checked: 2, online: 1, offline: 0, unknown: 1 });
+
+    // Second sweep: second consecutive failure confirms it offline.
     const res = await SELF.fetch(`${BASE}/api/admin/health-check`, { method: 'POST', headers: ADMIN });
     expect(res.status).toBe(200);
     const summary = (await res.json()) as { checked: number; online: number; offline: number };
