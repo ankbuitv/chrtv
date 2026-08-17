@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { SELF, env, fetchMock } from 'cloudflare:test';
-import { createToken } from '../src/token';
+import { createToken, verifyToken } from '../src/token';
 import { syncPlaylist } from '../src/playlist/sync';
 import { probeChannel, healthCheckBatch, MAX_PROBES_PER_RUN } from '../src/playlist/health';
 import { handleHlsManifest } from '../src/proxy/handlers';
-import { hashPassword, randomHex } from '../src/utils/crypto';
+import { handleSessionPlaylist } from '../src/auth/loginApi';
+import { hashPassword, hmacHex, randomHex } from '../src/utils/crypto';
 
 const ADMIN = { Authorization: `Bearer test-admin-token-0123456789` };
 const BASE = 'https://chrtv.example.com';
@@ -47,6 +48,32 @@ async function seedUser(username: string, password: string): Promise<void> {
     .run();
 }
 
+interface LoginResponseBody {
+  ok: boolean;
+  access_token: string;
+  playlist_url: string;
+  session: { id: number; device_name: string; created_at: number; expires_at: number | null };
+}
+
+async function loginSession(
+  username: string,
+  password: string,
+  deviceName: string,
+  ip: string,
+  replaceOldest = false,
+): Promise<{ response: Response; body: LoginResponseBody | { error: string } }> {
+  const response = await SELF.fetch(`${BASE}/api/login`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'CF-Connecting-IP': ip,
+      'User-Agent': `CHRTV-Test/${deviceName}`,
+    },
+    body: JSON.stringify({ username, password, device_name: deviceName, replace_oldest: replaceOldest }),
+  });
+  return { response, body: (await response.json()) as LoginResponseBody | { error: string } };
+}
+
 describe('routing basics', () => {
   it('GET / returns the landing page', async () => {
     const res = await SELF.fetch(`${BASE}/`);
@@ -54,6 +81,7 @@ describe('routing basics', () => {
     const html = await res.text();
     expect(html).toContain('CHRTV');
     expect(html).toContain('Cloud IPTV Gateway');
+    expect(html).not.toContain('/tv.m3u');
   });
 
   it('unknown route returns the Signal Lost 404 page', async () => {
@@ -81,12 +109,436 @@ describe('routing basics', () => {
     const res = await SELF.fetch(`${BASE}/healthz`, { headers: { 'X-Request-ID': 'client-req-id-123' } });
     expect(res.headers.get('X-Request-ID')).toBe('client-req-id-123');
   });
+
+  it('serves CSP-protected login/admin portals and same-origin scripts without embedding secrets', async () => {
+    for (const path of ['/login', '/admin']) {
+      const res = await SELF.fetch(`${BASE}${path}`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('Cache-Control')).toBe('no-store');
+      expect(res.headers.get('Content-Security-Policy')).toContain("frame-ancestors 'none'");
+      expect(res.headers.get('X-Frame-Options')).toBe('DENY');
+      const html = await res.text();
+      expect(html).toContain('CHRTV');
+      expect(html).not.toContain(env.ADMIN_TOKEN);
+      expect(html).not.toContain(env.SECRET_KEY);
+    }
+    for (const path of ['/ui/login.js', '/ui/admin.js']) {
+      const res = await SELF.fetch(`${BASE}${path}`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('Content-Type')).toContain('javascript');
+      expect(await res.text()).toContain('/api/');
+    }
+  });
+});
+
+describe('honeypot bans and private playlist login', () => {
+  it('returns a fake 404 for a scanner trap, then enforces a one-day privacy-preserving IP ban', async () => {
+    const ip = '203.0.113.201';
+    const trap = await SELF.fetch(`${BASE}/.git/config`, { headers: { 'CF-Connecting-IP': ip } });
+    expect(trap.status).toBe(404);
+    expect(await trap.text()).toContain('Signal Lost');
+
+    const row = await env.DB.prepare("SELECT * FROM security_bans WHERE reason = 'honeypot' ORDER BY last_seen DESC LIMIT 1")
+      .first<{ ip_hash: string; expires_at: number; hit_count: number }>();
+    expect(row?.ip_hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(row?.ip_hash).not.toContain(ip);
+    expect(row?.expires_at).toBeGreaterThanOrEqual(Math.floor(Date.now() / 1000) + 86_390);
+    expect(row?.hit_count).toBe(1);
+
+    const blocked = await SELF.fetch(`${BASE}/healthz`, { headers: { 'CF-Connecting-IP': ip } });
+    expect(blocked.status).toBe(403);
+    expect(((await blocked.json()) as { error: string }).error).toBe('SECURITY_BANNED');
+
+    const otherClient = await SELF.fetch(`${BASE}/healthz`, {
+      headers: { 'CF-Connecting-IP': '203.0.113.202' },
+    });
+    expect(otherClient.status).toBe(200);
+  });
+
+  it('returns the same fake 404 but does not ban browser-declared cross-site trap requests', async () => {
+    const ip = '203.0.113.204';
+    const expectedHash = await hmacHex(env.SECRET_KEY, `security-ban|${ip}`);
+    const trap = await SELF.fetch(`${BASE}/.env.production`, {
+      headers: {
+        'CF-Connecting-IP': ip,
+        'Sec-Fetch-Site': 'cross-site',
+        'Sec-Fetch-Mode': 'no-cors',
+        'Sec-Fetch-Dest': 'image',
+      },
+    });
+    expect(trap.status).toBe(404);
+    expect(await trap.text()).toContain('Signal Lost');
+    const ban = await env.DB.prepare('SELECT ip_hash FROM security_bans WHERE ip_hash = ?').bind(expectedHash).first();
+    expect(ban).toBeNull();
+    const stillAllowed = await SELF.fetch(`${BASE}/healthz`, { headers: { 'CF-Connecting-IP': ip } });
+    expect(stillAllowed.status).toBe(200);
+  });
+
+  it('lets an admin inspect and remove bans without exposing raw addresses', async () => {
+    const ip = '203.0.113.203';
+    await SELF.fetch(`${BASE}/wp-login.php`, { headers: { 'CF-Connecting-IP': ip } });
+
+    const list = await SELF.fetch(`${BASE}/api/admin/security-bans`, { headers: ADMIN });
+    expect(list.status).toBe(200);
+    const bans = (await list.json()) as Array<{ ip_hash: string; reason: string; expires_at: number }>;
+    const expectedHash = await hmacHex(env.SECRET_KEY, `security-ban|${ip}`);
+    const ban = bans.find((item) => item.ip_hash === expectedHash);
+    expect(ban).toMatchObject({ reason: 'honeypot' });
+    expect(JSON.stringify(bans)).not.toContain(ip);
+
+    const removed = await SELF.fetch(`${BASE}/api/admin/security-bans/${ban!.ip_hash}`, {
+      method: 'DELETE',
+      headers: ADMIN,
+    });
+    expect(removed.status).toBe(200);
+    const allowed = await SELF.fetch(`${BASE}/healthz`, { headers: { 'CF-Connecting-IP': ip } });
+    expect(allowed.status).toBe(200);
+  });
+
+  it('serves /lg/{username}?{password}.m3u only for an authenticated D1 user and binds tokens to that user', async () => {
+    await seedChannels();
+    await seedUser('private-user', 'private-pass-123');
+    const user = await env.DB.prepare("SELECT id FROM users WHERE username = 'private-user'").first<{ id: number }>();
+    const ip = '198.51.100.210';
+
+    const res = await SELF.fetch(`${BASE}/lg/private-user?private-pass-123.m3u`, {
+      headers: { 'CF-Connecting-IP': ip },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Cache-Control')).toContain('no-store');
+    expect(res.headers.get('Referrer-Policy')).toBe('no-referrer');
+    const body = await res.text();
+    expect(body).toContain('#EXTM3U');
+    expect(body).not.toContain('up.example.com');
+
+    const tokenUrl = body.split('\n').find((line) => line.includes('/hls/'))!;
+    const token = tokenUrl.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+    const verdict = await verifyToken(env.SECRET_KEY, token);
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) expect(verdict.payload).toMatchObject({ uid: user!.id, ip });
+    const event = await env.DB.prepare(
+      "SELECT user_id, username, event_type, route, outcome, ip_address FROM auth_events WHERE username = 'private-user' ORDER BY id DESC LIMIT 1",
+    ).first<{ user_id: number; username: string; event_type: string; route: string; outcome: string; ip_address: string }>();
+    expect(event).toMatchObject({
+      user_id: user!.id,
+      username: 'private-user',
+      event_type: 'playlist',
+      route: '/lg/:username',
+      outcome: 'success',
+      ip_address: ip,
+    });
+
+    // This endpoint is always private even while PUBLIC_PLAYLIST=true.
+    const unknown = await SELF.fetch(`${BASE}/lg/no-such-user?private-pass-123.m3u`, {
+      headers: { 'CF-Connecting-IP': '198.51.100.211' },
+    });
+    expect(unknown.status).toBe(401);
+    expect(((await unknown.json()) as { error: string }).error).toBe('AUTH_INVALID');
+  });
+
+  it('bans a private-login brute-force source after five failures in ten minutes', async () => {
+    await seedUser('brute-target', 'correct-password');
+    const ip = '198.51.100.212';
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      const res = await SELF.fetch(`${BASE}/lg/brute-target?wrong-${attempt}.m3u`, {
+        headers: { 'CF-Connecting-IP': ip },
+      });
+      expect(res.status).toBe(401);
+    }
+    const failureHash = await hmacHex(env.SECRET_KEY, `security-ban|${ip}`);
+    const durableCounter = await env.DB.prepare('SELECT failure_count FROM security_login_failures WHERE ip_hash = ?')
+      .bind(failureHash)
+      .first<{ failure_count: number }>();
+    expect(durableCounter?.failure_count).toBe(4);
+
+    const threshold = await SELF.fetch(`${BASE}/lg/brute-target?wrong-5.m3u`, {
+      headers: { 'CF-Connecting-IP': ip },
+    });
+    expect(threshold.status).toBe(429);
+    expect(threshold.headers.get('Retry-After')).toBe('86400');
+
+    const evenCorrectIsBlocked = await SELF.fetch(`${BASE}/lg/brute-target?correct-password.m3u`, {
+      headers: { 'CF-Connecting-IP': ip },
+    });
+    expect(evenCorrectIsBlocked.status).toBe(403);
+    const row = await env.DB.prepare("SELECT reason FROM security_bans WHERE reason = 'login-bruteforce' ORDER BY last_seen DESC LIMIT 1")
+      .first<{ reason: string }>();
+    expect(row?.reason).toBe('login-bruteforce');
+    const clearedCounter = await env.DB.prepare('SELECT failure_count FROM security_login_failures WHERE ip_hash = ?')
+      .bind(failureHash)
+      .first();
+    expect(clearedCounter).toBeNull();
+  });
+
+  it('rejects malformed private-login URLs without weakening /tv.m3u', async () => {
+    const malformed = await SELF.fetch(`${BASE}/lg/user?password=wrong.m3u`);
+    expect(malformed.status).toBe(400);
+    await seedChannels();
+    const publicPlaylist = await SELF.fetch(`${BASE}/tv.m3u`);
+    expect(publicPlaylist.status).toBe(200);
+    expect(await publicPlaylist.text()).toContain('#EXTM3U');
+  });
+});
+
+describe('opaque user sessions and authentication audit', () => {
+  it('exchanges POSTed credentials for a password-free, revocable M3U session', async () => {
+    await seedChannels();
+    await seedUser('safe-session-user', 'safe-password-123');
+    const user = await env.DB.prepare("SELECT id FROM users WHERE username = 'safe-session-user'").first<{ id: number }>();
+    const ip = '198.51.100.220';
+    const login = await loginSession('safe-session-user', 'safe-password-123', 'Living Room TV', ip);
+    expect(login.response.status).toBe(201);
+    expect(login.response.headers.get('Cache-Control')).toContain('no-store');
+    const body = login.body as LoginResponseBody;
+    expect(body.access_token).toMatch(/^[a-f0-9]{64}$/);
+    expect(body.playlist_url).toBe(`${BASE}/p/${body.access_token}.m3u`);
+    expect(body.playlist_url).not.toContain('safe-session-user');
+    expect(body.playlist_url).not.toContain('safe-password-123');
+
+    const stored = await env.DB.prepare(
+      'SELECT token_hash, token_prefix, device_name, ip_address, last_ip, status FROM user_sessions WHERE id = ?',
+    )
+      .bind(body.session.id)
+      .first<{ token_hash: string; token_prefix: string; device_name: string; ip_address: string; last_ip: string; status: string }>();
+    expect(stored).toMatchObject({
+      token_prefix: body.access_token.slice(0, 12),
+      device_name: 'Living Room TV',
+      ip_address: ip,
+      last_ip: ip,
+      status: 'active',
+    });
+    expect(stored!.token_hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(stored!.token_hash).not.toBe(body.access_token);
+
+    const playlist = await SELF.fetch(body.playlist_url, {
+      headers: { 'CF-Connecting-IP': ip, 'User-Agent': 'CHRTV-Test/Playback' },
+    });
+    expect(playlist.status).toBe(200);
+    const m3u = await playlist.text();
+    expect(m3u).toContain('#EXTM3U');
+    expect(m3u).not.toContain('safe-password-123');
+    expect(m3u).not.toContain('up.example.com');
+    const mediaUrl = m3u.split('\n').find((line) => line.includes('/hls/'))!;
+    const mediaToken = mediaUrl.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+    const media = await verifyToken(env.SECRET_KEY, mediaToken);
+    expect(media.ok).toBe(true);
+    if (media.ok) expect(media.payload).toMatchObject({ uid: user!.id, sid: body.session.id, ip, k: 'm' });
+
+    const account = await SELF.fetch(`${BASE}/api/account/sessions`, {
+      headers: { Authorization: `Bearer ${body.access_token}`, 'CF-Connecting-IP': '198.51.100.221' },
+    });
+    expect(account.status).toBe(200);
+    const accountBody = (await account.json()) as {
+      current_session_id: number;
+      user: { username: string; max_connections: number };
+      sessions: Array<{ id: number; last_ip: string }>;
+    };
+    expect(accountBody.user).toMatchObject({ username: 'safe-session-user', max_connections: 1 });
+    expect(accountBody.current_session_id).toBe(body.session.id);
+    expect(accountBody.sessions.find((session) => session.id === body.session.id)?.last_ip).toBe('198.51.100.221');
+
+    const events = await env.DB.prepare(
+      "SELECT event_type, outcome, ip_address, user_id, session_id FROM auth_events WHERE username = 'safe-session-user' ORDER BY id",
+    ).all<{ event_type: string; outcome: string; ip_address: string; user_id: number; session_id: number }>();
+    expect(events.results).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ event_type: 'login', outcome: 'success', ip_address: ip, user_id: user!.id }),
+        expect.objectContaining({ event_type: 'playlist', outcome: 'success', ip_address: ip, session_id: body.session.id }),
+      ]),
+    );
+
+    const revoked = await SELF.fetch(`${BASE}/api/account/sessions/${body.session.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${body.access_token}` },
+    });
+    expect(revoked.status).toBe(200);
+    const blocked = await SELF.fetch(body.playlist_url);
+    expect(blocked.status).toBe(403);
+    expect(((await blocked.json()) as { error: string }).error).toBe('AUTH_DISABLED');
+
+    // A previously downloaded channel capability is also stopped before the
+    // next manifest fetch. Descendant segments already issued by an earlier
+    // manifest remain short-lived and cannot outlive this parent capability.
+    const revokedMedia = await SELF.fetch(mediaUrl, {
+      headers: { 'CF-Connecting-IP': ip },
+      redirect: 'manual',
+    });
+    expect(revokedMedia.status).toBe(403);
+    expect(((await revokedMedia.json()) as { error: string }).error).toBe('AUTH_DISABLED');
+  });
+
+  it('rejects an issued session capability after session expiry, user disablement, or user expiry', async () => {
+    await seedChannels();
+    await seedUser('active-session-checks', 'active-password-123');
+    const login = await loginSession('active-session-checks', 'active-password-123', 'Expiry TV', '198.51.100.225');
+    expect(login.response.status).toBe(201);
+    const body = login.body as LoginResponseBody;
+    const user = await env.DB.prepare("SELECT id FROM users WHERE username = 'active-session-checks'").first<{ id: number }>();
+    const now = Math.floor(Date.now() / 1000);
+    const earlierSessionExpiry = now + 3600;
+    await env.DB.prepare('UPDATE user_sessions SET expires_at = ? WHERE id = ?').bind(earlierSessionExpiry, body.session.id).run();
+    await env.DB.prepare('UPDATE users SET expires_at = ? WHERE id = ?').bind(now + 7200, user!.id).run();
+    const playlist = await SELF.fetch(body.playlist_url, { headers: { 'CF-Connecting-IP': '198.51.100.225' } });
+    const mediaUrl = (await playlist.text()).split('\n').find((line) => line.includes('/hls/'))!;
+    const mediaToken = mediaUrl.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+    const issued = await verifyToken(env.SECRET_KEY, mediaToken);
+    expect(issued.ok).toBe(true);
+    if (issued.ok) expect(issued.payload.exp).toBe(earlierSessionExpiry);
+
+    await env.DB.prepare('UPDATE user_sessions SET expires_at = ? WHERE id = ?').bind(now - 1, body.session.id).run();
+    expect((await SELF.fetch(mediaUrl, { headers: { 'CF-Connecting-IP': '198.51.100.225' } })).status).toBe(403);
+
+    await env.DB.prepare('UPDATE user_sessions SET expires_at = NULL WHERE id = ?').bind(body.session.id).run();
+    await env.DB.prepare("UPDATE users SET status = 'disabled', expires_at = NULL WHERE id = ?").bind(user!.id).run();
+    expect((await SELF.fetch(mediaUrl, { headers: { 'CF-Connecting-IP': '198.51.100.225' } })).status).toBe(403);
+
+    await env.DB.prepare("UPDATE users SET status = 'active', expires_at = ? WHERE id = ?").bind(now - 1, user!.id).run();
+    const expiredUser = await SELF.fetch(mediaUrl, { headers: { 'CF-Connecting-IP': '198.51.100.225' } });
+    expect(expiredUser.status).toBe(403);
+    expect(((await expiredUser.json()) as { error: string }).error).toBe('AUTH_DISABLED');
+  });
+
+  it('keeps session ownership authorization active when TOKEN_BINDING=none', async () => {
+    await seedChannels();
+    await seedUser('none-binding-session', 'none-password-123');
+    const login = await loginSession('none-binding-session', 'none-password-123', 'Unbound TV', '198.51.100.226');
+    expect(login.response.status).toBe(201);
+    const body = login.body as LoginResponseBody;
+    const noBindingEnv = { ...env, TOKEN_BINDING: 'none' };
+    const playlist = await handleSessionPlaylist(
+      new Request(body.playlist_url, { headers: { 'CF-Connecting-IP': '198.51.100.226' } }),
+      noBindingEnv,
+      'req-none-binding-playlist',
+      `${body.access_token}.m3u`,
+    );
+    expect(playlist.status).toBe(200);
+    const mediaUrl = (await playlist.text()).split('\n').find((line) => line.includes('/hls/'))!;
+    const token = mediaUrl.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+    const verdict = await verifyToken(env.SECRET_KEY, token);
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) {
+      expect(verdict.payload).toMatchObject({ sid: body.session.id, k: 'm' });
+      expect(verdict.payload.uid).toBeGreaterThan(0);
+      expect(verdict.payload.ip).toBeUndefined();
+    }
+
+    fetchMock
+      .get('https://up.example.com')
+      .intercept({ path: '/live/vtv1/index.m3u8' })
+      .reply(200, '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg.ts\n#EXT-X-ENDLIST\n');
+    const active = await handleHlsManifest(new Request(mediaUrl), noBindingEnv, 'req-none-binding-active', token);
+    expect(active.status).toBe(200);
+
+    await env.DB.prepare("UPDATE user_sessions SET status = 'revoked' WHERE id = ?").bind(body.session.id).run();
+    const revoked = await handleHlsManifest(new Request(mediaUrl), noBindingEnv, 'req-none-binding-revoked', token);
+    expect(revoked.status).toBe(403);
+    expect(((await revoked.json()) as { error: string }).error).toBe('AUTH_DISABLED');
+  });
+
+  it('enforces max_connections, optionally replaces the oldest session, and scopes revocation by user', async () => {
+    await seedUser('limit-session-user', 'limit-password-123');
+    await seedUser('other-session-user', 'other-password-123');
+    const first = await loginSession('limit-session-user', 'limit-password-123', 'Old TV', '198.51.100.222');
+    expect(first.response.status).toBe(201);
+    const firstBody = first.body as LoginResponseBody;
+
+    const limited = await loginSession('limit-session-user', 'limit-password-123', 'New TV', '198.51.100.223');
+    expect(limited.response.status).toBe(409);
+    expect(limited.body).toMatchObject({ error: 'SESSION_LIMIT' });
+
+    const replacement = await loginSession('limit-session-user', 'limit-password-123', 'New TV', '198.51.100.223', true);
+    expect(replacement.response.status).toBe(201);
+    const replacementBody = replacement.body as LoginResponseBody;
+    expect(replacementBody.session.id).not.toBe(firstBody.session.id);
+    expect((await SELF.fetch(firstBody.playlist_url)).status).toBe(403);
+
+    const other = await loginSession('other-session-user', 'other-password-123', 'Other TV', '198.51.100.224');
+    expect(other.response.status).toBe(201);
+    const otherBody = other.body as LoginResponseBody;
+    const crossAccount = await SELF.fetch(`${BASE}/api/account/sessions/${otherBody.session.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${replacementBody.access_token}` },
+    });
+    expect(crossAccount.status).toBe(404);
+    const otherStillActive = await SELF.fetch(`${BASE}/api/account/sessions`, {
+      headers: { Authorization: `Bearer ${otherBody.access_token}` },
+    });
+    expect(otherStillActive.status).toBe(200);
+
+    const limitEvent = await env.DB.prepare(
+      "SELECT outcome, ip_address FROM auth_events WHERE username = 'limit-session-user' AND outcome = 'limit' ORDER BY id DESC LIMIT 1",
+    ).first<{ outcome: string; ip_address: string }>();
+    expect(limitEvent).toEqual({ outcome: 'limit', ip_address: '198.51.100.223' });
+  });
+
+  it('lets admins inspect/revoke sessions and keeps account/session expiry in sync', async () => {
+    await seedUser('admin-session-user', 'admin-password-123');
+    const login = await loginSession('admin-session-user', 'admin-password-123', 'Admin Managed TV', '192.0.2.230');
+    expect(login.response.status).toBe(201);
+    const body = login.body as LoginResponseBody;
+    const user = await env.DB.prepare("SELECT id FROM users WHERE username = 'admin-session-user'").first<{ id: number }>();
+    const expiry = Math.floor(Date.now() / 1000) + 7 * 24 * 3600;
+
+    const patch = await SELF.fetch(`${BASE}/api/admin/users/${user!.id}`, {
+      method: 'PATCH',
+      headers: { ...ADMIN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_connections: 3, expires_at: expiry }),
+    });
+    expect(patch.status).toBe(200);
+    const synchronized = await env.DB.prepare(
+      'SELECT u.max_connections, u.expires_at AS user_expiry, s.expires_at AS session_expiry FROM users u JOIN user_sessions s ON s.user_id = u.id WHERE s.id = ?',
+    )
+      .bind(body.session.id)
+      .first<{ max_connections: number; user_expiry: number; session_expiry: number }>();
+    expect(synchronized).toEqual({ max_connections: 3, user_expiry: expiry, session_expiry: expiry });
+
+    const sessions = (await (await SELF.fetch(`${BASE}/api/admin/sessions`, { headers: ADMIN })).json()) as Array<{
+      id: number;
+      username: string;
+      ip_address: string;
+    }>;
+    expect(sessions).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: body.session.id, username: 'admin-session-user', ip_address: '192.0.2.230' })]),
+    );
+    const events = (await (
+      await SELF.fetch(`${BASE}/api/admin/auth-events?limit=1000`, { headers: ADMIN })
+    ).json()) as Array<{ username: string; ip_address: string; outcome: string }>;
+    expect(events).toEqual(
+      expect.arrayContaining([expect.objectContaining({ username: 'admin-session-user', ip_address: '192.0.2.230', outcome: 'success' })]),
+    );
+
+    const revoke = await SELF.fetch(`${BASE}/api/admin/sessions/${body.session.id}`, { method: 'DELETE', headers: ADMIN });
+    expect(revoke.status).toBe(200);
+    expect((await SELF.fetch(body.playlist_url)).status).toBe(403);
+
+    const second = await loginSession('admin-session-user', 'admin-password-123', 'Second TV', '192.0.2.231');
+    expect(second.response.status).toBe(201);
+    const disable = await SELF.fetch(`${BASE}/api/admin/users/${user!.id}`, {
+      method: 'PATCH',
+      headers: { ...ADMIN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'disabled' }),
+    });
+    expect(disable.status).toBe(200);
+    const sessionStatus = await env.DB.prepare('SELECT status FROM user_sessions WHERE id = ?')
+      .bind((second.body as LoginResponseBody).session.id)
+      .first<{ status: string }>();
+    expect(sessionStatus?.status).toBe('revoked');
+    expect((await SELF.fetch((second.body as LoginResponseBody).playlist_url)).status).toBe(403);
+
+    const badLimit = await SELF.fetch(`${BASE}/api/admin/users/${user!.id}`, {
+      method: 'PATCH',
+      headers: { ...ADMIN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_connections: 101 }),
+    });
+    expect(badLimit.status).toBe(400);
+  });
 });
 
 describe('/tv.m3u playlist', () => {
-  it('serves a tokenized playlist with zero configuration', async () => {
+  it('serves and audits a tokenized public playlist with zero credentials', async () => {
     await seedChannels();
-    const res = await SELF.fetch(`${BASE}/tv.m3u`);
+    const ip = '192.0.2.244';
+    const res = await SELF.fetch(`${BASE}/tv.m3u`, { headers: { 'CF-Connecting-IP': ip } });
     expect(res.status).toBe(200);
     expect(res.headers.get('Content-Type')).toContain('mpegurl');
     const body = await res.text();
@@ -94,21 +546,46 @@ describe('/tv.m3u playlist', () => {
     expect(body).toContain('VTV1');
     expect(body).toContain(`${BASE}/hls/`);
     expect(body).not.toContain('up.example.com'); // upstream never exposed
+    const event = await env.DB.prepare(
+      "SELECT username, event_type, route, outcome, ip_address FROM auth_events WHERE route = '/tv.m3u' ORDER BY id DESC LIMIT 1",
+    ).first<{ username: string; event_type: string; route: string; outcome: string; ip_address: string }>();
+    expect(event).toEqual({ username: '', event_type: 'playlist', route: '/tv.m3u', outcome: 'success', ip_address: ip });
   });
 
-  it('serves direct URLs for channels with non-standard ports in playlist', async () => {
+  it('keeps custom-port channels opaque and never reveals their origin in a redirect', async () => {
     await seedChannels();
     const now = Math.floor(Date.now() / 1000);
+    const upstream = 'http://chrtv.duckdns.org:4000/hls/hbo/master.m3u8';
     await env.DB.prepare(
       `INSERT OR REPLACE INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
-       VALUES ('aaaaaaaaaaaaaaa3', 100003, 'HBO Custom', 'http://chrtv.duckdns.org:18483/stream/cg_hbofam/index.m3u8', 'hbo-custom', '', 1, 2, 1, 1, ?, ?)`,
-    ).bind(now, now).run();
+       VALUES ('aaaaaaaaaaaaaaa3', 100003, 'HBO Custom', ?, 'hbo-custom', '', 1, 2, 1, 1, ?, ?)`,
+    ).bind(upstream, now, now).run();
 
     const res = await SELF.fetch(`${BASE}/tv.m3u`);
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toContain('HBO Custom');
-    expect(body).toContain('http://chrtv.duckdns.org:18483/stream/cg_hbofam/index.m3u8');
+    expect(body).not.toContain(upstream); // no raw upstream leaks in the M3U
+
+    const lines = body.trim().split('\n');
+    const hboInfo = lines.findIndex((line) => line.includes('HBO Custom'));
+    const tokenUrl = lines[hboInfo + 1]!;
+    expect(tokenUrl).toContain(`${BASE}/hls/`);
+    const token = tokenUrl.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+    const verdict = await verifyToken(env.SECRET_KEY, token);
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) expect(verdict.payload.u).toBe(upstream);
+
+    // Workers cannot fetch this port. Even after token authentication, CHRTV
+    // fails closed to a valid error manifest and never returns the raw origin.
+    const stream = await SELF.fetch(tokenUrl, { redirect: 'manual' });
+    expect(stream.status).toBe(200);
+    expect(stream.headers.get('Location')).toBeNull();
+    expect(stream.headers.get('X-CHRTV-Fallback')).toBe('1');
+    const streamBody = await stream.text();
+    expect(streamBody).toContain('#EXT-X-ENDLIST');
+    expect(streamBody).not.toContain(upstream);
+    expect(streamBody).not.toContain('chrtv.duckdns.org');
   });
 
   it('/xem.m3u is an alias of the same playlist', async () => {
@@ -126,20 +603,29 @@ describe('/tv.m3u playlist', () => {
     expect(await res.text()).toBe('');
   });
 
-  it('rejects an invalid access key even in public mode', async () => {
-    const res = await SELF.fetch(`${BASE}/tv.m3u?key=chr_definitely_wrong_key`);
+  it('rejects an invalid access key even in public mode and records the raw source IP', async () => {
+    const ip = '192.0.2.240';
+    const res = await SELF.fetch(`${BASE}/tv.m3u?key=chr_definitely_wrong_key`, {
+      headers: { 'CF-Connecting-IP': ip },
+    });
     expect(res.status).toBe(401);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe('KEY_INVALID');
+    const event = await env.DB.prepare(
+      "SELECT event_type, route, outcome, ip_address FROM auth_events WHERE event_type = 'access_key' AND ip_address = ? ORDER BY id DESC LIMIT 1",
+    )
+      .bind(ip)
+      .first<{ event_type: string; route: string; outcome: string; ip_address: string }>();
+    expect(event).toEqual({ event_type: 'access_key', route: '/tv.m3u', outcome: 'failure', ip_address: ip });
   });
 });
 
 describe('access keys + MAC devices', () => {
-  async function createKey(maxDevices = 2): Promise<string> {
+  async function createKey(maxDevices = 2, userId?: number): Promise<string> {
     const res = await SELF.fetch(`${BASE}/api/admin/keys`, {
       method: 'POST',
       headers: { ...ADMIN, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ label: 'test', max_devices: maxDevices }),
+      body: JSON.stringify({ label: 'test', max_devices: maxDevices, ...(userId ? { user_id: userId } : {}) }),
     });
     expect(res.status).toBe(201);
     const body = (await res.json()) as { access_key: string };
@@ -168,8 +654,92 @@ describe('access keys + MAC devices', () => {
     expect(((await r4.json()) as { error: string }).error).toBe('DEVICE_LIMIT');
   });
 
-  it('revoked keys are rejected', async () => {
+  it('personalizes tokens by Cloudflare IP, normalized MAC, access-key id, and linked user id', async () => {
+    await seedChannels();
+    await seedUser('bound-user', 'password123');
+    const user = await env.DB.prepare("SELECT id FROM users WHERE username = 'bound-user'").first<{ id: number }>();
+    const key = await createKey(2, user!.id);
+
+    const playlist = await SELF.fetch(`${BASE}/tv.m3u?key=${key}&mac=aa-bb-cc-11-22-33`, {
+      headers: { 'CF-Connecting-IP': '203.0.113.10' },
+    });
+    expect(playlist.status).toBe(200);
+    const body = await playlist.text();
+    const tokenUrl = body.split('\n').find((line) => line.includes('/hls/'))!;
+    const token = tokenUrl.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+    const verdict = await verifyToken(env.SECRET_KEY, token);
+    expect(verdict.ok).toBe(true);
+    if (!verdict.ok) return;
+
+    const keyRow = await env.DB.prepare('SELECT id, user_id FROM access_keys WHERE id = ?')
+      .bind(verdict.payload.aid)
+      .first<{ id: number; user_id: number }>();
+    expect(verdict.payload).toMatchObject({
+      ip: '203.0.113.10',
+      mac: 'AA:BB:CC:11:22:33',
+      uid: user!.id,
+      aid: keyRow!.id,
+    });
+    expect(keyRow!.user_id).toBe(user!.id);
+
+    // The IP is independently observed by Cloudflare and strictly enforced.
+    // No upstream mock is registered, so a successful rejection cannot have
+    // reached the channel origin.
+    const stolen = await SELF.fetch(tokenUrl, {
+      headers: { 'CF-Connecting-IP': '203.0.113.99' },
+      redirect: 'manual',
+    });
+    expect(stolen.status).toBe(403);
+    expect(((await stolen.json()) as { error: string }).error).toBe('TOKEN_BINDING_MISMATCH');
+  });
+
+  it('rejects a linked key when its owner user is disabled', async () => {
+    await seedUser('disabled-owner', 'password123');
+    const user = await env.DB.prepare("SELECT id FROM users WHERE username = 'disabled-owner'").first<{ id: number }>();
+    const key = await createKey(2, user!.id);
+    await env.DB.prepare("UPDATE users SET status = 'disabled' WHERE id = ?").bind(user!.id).run();
+
+    const res = await SELF.fetch(`${BASE}/tv.m3u?key=${key}`);
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe('AUTH_DISABLED');
+  });
+
+  it('rejects an issued key capability after key expiry, ownership changes, or owner expiry', async () => {
+    await seedChannels();
+    await seedUser('issued-key-owner-a', 'password123');
+    await seedUser('issued-key-owner-b', 'password123');
+    const ownerA = await env.DB.prepare("SELECT id FROM users WHERE username = 'issued-key-owner-a'").first<{ id: number }>();
+    const ownerB = await env.DB.prepare("SELECT id FROM users WHERE username = 'issued-key-owner-b'").first<{ id: number }>();
+    const key = await createKey(2, ownerA!.id);
+    const issued = await SELF.fetch(`${BASE}/tv.m3u?key=${key}`);
+    expect(issued.status).toBe(200);
+    const mediaUrl = (await issued.text()).split('\n').find((line) => line.includes('/hls/'))!;
+    const token = mediaUrl.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+    const verdict = await verifyToken(env.SECRET_KEY, token);
+    expect(verdict.ok).toBe(true);
+    const keyId = verdict.ok ? verdict.payload.aid! : 0;
+    const now = Math.floor(Date.now() / 1000);
+
+    await env.DB.prepare('UPDATE access_keys SET expires_at = ? WHERE id = ?').bind(now - 1, keyId).run();
+    expect((await SELF.fetch(mediaUrl)).status).toBe(403);
+
+    await env.DB.prepare('UPDATE access_keys SET expires_at = NULL, user_id = ? WHERE id = ?').bind(ownerB!.id, keyId).run();
+    expect((await SELF.fetch(mediaUrl)).status).toBe(403);
+
+    await env.DB.prepare('UPDATE access_keys SET user_id = ? WHERE id = ?').bind(ownerA!.id, keyId).run();
+    await env.DB.prepare('UPDATE users SET expires_at = ? WHERE id = ?').bind(now - 1, ownerA!.id).run();
+    const expiredOwner = await SELF.fetch(mediaUrl);
+    expect(expiredOwner.status).toBe(403);
+    expect(((await expiredOwner.json()) as { error: string }).error).toBe('AUTH_DISABLED');
+  });
+
+  it('revoked keys and their previously downloaded manifest capabilities are rejected', async () => {
+    await seedChannels();
     const key = await createKey();
+    const issued = await SELF.fetch(`${BASE}/tv.m3u?key=${key}`);
+    expect(issued.status).toBe(200);
+    const tokenUrl = (await issued.text()).split('\n').find((line) => line.includes('/hls/'))!;
+
     const list = await SELF.fetch(`${BASE}/api/admin/keys`, { headers: ADMIN });
     const keys = (await list.json()) as Array<{ id: number; key_prefix: string }>;
     const row = keys.find((k) => key.startsWith(k.key_prefix))!;
@@ -177,6 +747,10 @@ describe('access keys + MAC devices', () => {
     expect(del.status).toBe(200);
     const res = await SELF.fetch(`${BASE}/tv.m3u?key=${key}`);
     expect(res.status).toBe(403);
+
+    const media = await SELF.fetch(tokenUrl, { redirect: 'manual' });
+    expect(media.status).toBe(403);
+    expect(((await media.json()) as { error: string }).error).toBe('AUTH_DISABLED');
   });
 });
 
@@ -229,6 +803,43 @@ describe('admin API', () => {
     });
   });
 
+  it('links and clears an access-key owner by user id', async () => {
+    await seedUser('key-owner', 'password123');
+    const owner = await env.DB.prepare("SELECT id FROM users WHERE username = 'key-owner'").first<{ id: number }>();
+    const create = await SELF.fetch(`${BASE}/api/admin/keys`, {
+      method: 'POST',
+      headers: { ...ADMIN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'owner test' }),
+    });
+    const created = (await create.json()) as { access_key: string };
+    const list = await SELF.fetch(`${BASE}/api/admin/keys`, { headers: ADMIN });
+    const key = ((await list.json()) as Array<{ id: number; key_prefix: string }>).find((row) =>
+      created.access_key.startsWith(row.key_prefix),
+    )!;
+
+    const link = await SELF.fetch(`${BASE}/api/admin/keys/${key.id}`, {
+      method: 'PATCH',
+      headers: { ...ADMIN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: owner!.id }),
+    });
+    expect(link.status).toBe(200);
+    const linked = await env.DB.prepare('SELECT user_id, username FROM access_keys WHERE id = ?')
+      .bind(key.id)
+      .first<{ user_id: number | null; username: string }>();
+    expect(linked).toEqual({ user_id: owner!.id, username: 'key-owner' });
+
+    const clear = await SELF.fetch(`${BASE}/api/admin/keys/${key.id}`, {
+      method: 'PATCH',
+      headers: { ...ADMIN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: null }),
+    });
+    expect(clear.status).toBe(200);
+    const cleared = await env.DB.prepare('SELECT user_id, username FROM access_keys WHERE id = ?')
+      .bind(key.id)
+      .first<{ user_id: number | null; username: string }>();
+    expect(cleared).toEqual({ user_id: null, username: '' });
+  });
+
   it('rejects weak user input', async () => {
     const res = await SELF.fetch(`${BASE}/api/admin/users`, {
       method: 'POST',
@@ -263,36 +874,68 @@ describe('Xtream Codes API', () => {
     const streams = await SELF.fetch(`${BASE}/player_api.php?username=bob&password=password123&action=get_live_streams`);
     const list = (await streams.json()) as Array<{ name: string; stream_id: number; direct_source: string }>;
     expect(list.length).toBeGreaterThanOrEqual(2);
-    expect(list[0]!.direct_source).toBe(''); // upstream never exposed
+    expect(list[0]!.direct_source).toMatch(/^https:\/\/chrtv\.example\.com\/hls\/.+\.m3u8$/);
+    expect(list[0]!.direct_source).not.toContain('up.example.com');
+    const directToken = list[0]!.direct_source.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+    const verdict = await verifyToken(env.SECRET_KEY, directToken);
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) expect(verdict.payload).toMatchObject({ k: 'm' });
     expect(list.some((s) => s.name === 'VTV1')).toBe(true);
   });
 
-  it('get.php requires valid credentials and returns the tokenized M3U', async () => {
+  it('get.php requires valid credentials, returns tokenized M3U, and audits raw IP/outcome', async () => {
     await seedChannels();
     await seedUser('bob', 'password123');
-    const bad = await SELF.fetch(`${BASE}/get.php?username=bob&password=wrong`);
+    const bob = await env.DB.prepare("SELECT id FROM users WHERE username = 'bob'").first<{ id: number }>();
+    const badIp = '192.0.2.242';
+    const goodIp = '192.0.2.243';
+    const bad = await SELF.fetch(`${BASE}/get.php?username=bob&password=wrong`, {
+      headers: { 'CF-Connecting-IP': badIp },
+    });
     expect(bad.status).toBe(401);
-    const ok = await SELF.fetch(`${BASE}/get.php?username=bob&password=password123&type=m3u_plus`);
+    const ok = await SELF.fetch(`${BASE}/get.php?username=bob&password=password123&type=m3u_plus`, {
+      headers: { 'CF-Connecting-IP': goodIp },
+    });
     expect(ok.status).toBe(200);
     const text = await ok.text();
     expect(text).toContain('#EXTM3U');
     expect(text).not.toContain('up.example.com');
+    const events = await env.DB.prepare(
+      "SELECT event_type, route, outcome, ip_address, user_id FROM auth_events WHERE username = 'bob' AND route = '/get.php' ORDER BY id DESC LIMIT 2",
+    ).all<{ event_type: string; route: string; outcome: string; ip_address: string; user_id: number | null }>();
+    expect(events.results).toEqual(
+      expect.arrayContaining([
+        { event_type: 'playlist', route: '/get.php', outcome: 'failure', ip_address: badIp, user_id: null },
+        { event_type: 'playlist', route: '/get.php', outcome: 'success', ip_address: goodIp, user_id: bob!.id },
+      ]),
+    );
   });
 
-  it('get.php works for a fresh Xtream client in public mode (no pre-created user)', async () => {
+  it('get.php binds its M3U tokens to the authenticated D1 user id and client IP', async () => {
     await seedChannels();
-    const res = await SELF.fetch(`${BASE}/get.php?username=anyuser&password=anypass&type=m3u_plus&output=m3u8`);
+    await seedUser('token-user', 'password123');
+    const user = await env.DB.prepare("SELECT id FROM users WHERE username = 'token-user'").first<{ id: number }>();
+    const res = await SELF.fetch(`${BASE}/get.php?username=token-user&password=password123&mac=0011.2233.4455`, {
+      headers: { 'CF-Connecting-IP': '192.0.2.44' },
+    });
     expect(res.status).toBe(200);
-    const text = await res.text();
-    expect(text).toContain('#EXTM3U');
-    expect(text).toContain('VTV1');
-    expect(text).not.toContain('up.example.com');
+    const tokenUrl = (await res.text()).split('\n').find((line) => line.includes('/hls/'))!;
+    const token = tokenUrl.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+    const verdict = await verifyToken(env.SECRET_KEY, token);
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) {
+      expect(verdict.payload).toMatchObject({ ip: '192.0.2.44', mac: '00:11:22:33:44:55', uid: user!.id });
+      expect(verdict.payload.aid).toBeUndefined();
+    }
   });
 
-  it('player_api handshake succeeds for a guest in public mode', async () => {
-    const res = await SELF.fetch(`${BASE}/player_api.php?username=guest1&password=guest1`);
-    expect(res.status).toBe(200);
-    expect(((await res.json()) as { user_info: { auth: number } }).user_info.auth).toBe(1);
+  it('does not turn PUBLIC_PLAYLIST into anonymous Xtream access', async () => {
+    await seedChannels();
+    const get = await SELF.fetch(`${BASE}/get.php?username=anyuser&password=anypass&type=m3u_plus&output=m3u8`);
+    expect(get.status).toBe(401);
+    const player = await SELF.fetch(`${BASE}/player_api.php?username=guest1&password=guest1`);
+    expect(player.status).toBe(200);
+    expect(((await player.json()) as { user_info: { auth: number } }).user_info.auth).toBe(0);
   });
 
   it('a wrong password for an EXISTING user is still rejected', async () => {
@@ -309,10 +952,11 @@ describe('Xtream Codes API', () => {
 
   it('accepts POSTed JSON credentials (IPTV Smarters style)', async () => {
     await seedChannels();
+    await seedUser('jsonuser', 'jsonpass123');
     const res = await SELF.fetch(`${BASE}/player_api.php`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'jsonuser', password: 'jsonpass' }),
+      body: JSON.stringify({ username: 'jsonuser', password: 'jsonpass123' }),
     });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { user_info: { auth: number }; server_info: { url: string } };
@@ -321,35 +965,39 @@ describe('Xtream Codes API', () => {
   });
 
   it('accepts HTTP Basic credentials', async () => {
+    await seedUser('basicuser', 'basicpass123');
     const res = await SELF.fetch(`${BASE}/player_api.php`, {
-      headers: { Authorization: `Basic ${btoa('basicuser:basicpass')}` },
+      headers: { Authorization: `Basic ${btoa('basicuser:basicpass123')}` },
     });
     expect(res.status).toBe(200);
     expect(((await res.json()) as { user_info: { auth: number } }).user_info.auth).toBe(1);
   });
 
-  it('handshakes even when the client sends no credentials in public mode', async () => {
+  it('rejects a credential-free handshake even when /tv.m3u is public', async () => {
     const res = await SELF.fetch(`${BASE}/player_api.php`);
     expect(res.status).toBe(200);
-    expect(((await res.json()) as { user_info: { auth: number } }).user_info.auth).toBe(1);
+    expect(((await res.json()) as { user_info: { auth: number } }).user_info.auth).toBe(0);
   });
 
   it('advertises both m3u8 and ts output formats', async () => {
-    const res = await SELF.fetch(`${BASE}/player_api.php?username=fmt&password=fmt`);
+    await seedUser('fmtuser', 'fmtpass123');
+    const res = await SELF.fetch(`${BASE}/player_api.php?username=fmtuser&password=fmtpass123`);
     const body = (await res.json()) as { user_info: { allowed_output_formats: string[] } };
     expect(body.user_info.allowed_output_formats).toContain('m3u8');
     expect(body.user_info.allowed_output_formats).toContain('ts');
   });
 
   it('an unknown action still returns a valid authenticated payload', async () => {
-    const res = await SELF.fetch(`${BASE}/player_api.php?username=u&password=p&action=get_something_new`);
+    await seedUser('unknownaction', 'unknownpass123');
+    const res = await SELF.fetch(`${BASE}/player_api.php?username=unknownaction&password=unknownpass123&action=get_something_new`);
     const body = (await res.json()) as { user_info: { auth: number } };
     expect(body.user_info.auth).toBe(1);
   });
 
   it('/panel_api.php returns user_info plus the channel map', async () => {
     await seedChannels();
-    const res = await SELF.fetch(`${BASE}/panel_api.php?username=panel&password=panel`);
+    await seedUser('paneluser', 'panelpass123');
+    const res = await SELF.fetch(`${BASE}/panel_api.php?username=paneluser&password=panelpass123`);
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       user_info: { auth: number };
@@ -399,6 +1047,28 @@ describe('HLS proxy', () => {
     expect(((await res.json()) as { error: string }).error).toBe('TOKEN_EXPIRED');
   });
 
+  it('treats token kinds as route capabilities and rejects cross-route substitution', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const segment = await createToken(env.SECRET_KEY, {
+      u: 'https://kind.example.com/segment.ts',
+      iat: now,
+      exp: now + 300,
+      k: 's',
+    });
+    const epg = await createToken(env.SECRET_KEY, {
+      u: 'https://epg-token.chrtv.invalid/xmltv.xml',
+      iat: now,
+      exp: now + 300,
+      k: 'e',
+    });
+    const manifest = await mintToken('https://kind.example.com/index.m3u8');
+    for (const url of [`${BASE}/hls/${segment}.m3u8`, `${BASE}/hls/${epg}.m3u8`, `${BASE}/seg/${manifest}.m3u8`]) {
+      const res = await SELF.fetch(url);
+      expect(res.status).toBe(403);
+      expect(((await res.json()) as { error: string }).error).toBe('TOKEN_INVALID');
+    }
+  });
+
   it('proxies and rewrites a valid manifest (relative URIs, EXT-X-KEY)', async () => {
     const manifest = [
       '#EXTM3U',
@@ -423,6 +1093,72 @@ describe('HLS proxy', () => {
     expect(body).not.toContain('up2.example.com');
     expect(body).toContain('METHOD=AES-128');
     expect(res.headers.get('X-CHRTV-Fallback')).toBeNull();
+  });
+
+  it('fails closed when an upstream manifest contains an unsafe descendant URI', async () => {
+    const manifest = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nhttp://169.254.169.254/latest/meta-data\n#EXT-X-ENDLIST\n';
+    fetchMock.get('https://unsafe-child.example.com').intercept({ path: '/index.m3u8' }).reply(200, manifest);
+    const token = await mintToken('https://unsafe-child.example.com/index.m3u8', { channel: 'unsafechild00001' });
+    const res = await SELF.fetch(`${BASE}/hls/${token}.m3u8`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('X-CHRTV-Fallback')).toBe('1');
+    const body = await res.text();
+    expect(body).toContain('#EXT-X-ENDLIST');
+    expect(body).not.toContain('169.254.169.254');
+    expect(body).not.toContain('/seg/');
+  });
+
+  it('inherits IP, MAC, user id, access-key id, and channel id into segment tokens', async () => {
+    const manifest = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nbound.ts\n#EXT-X-ENDLIST\n';
+    fetchMock.get('https://bound.example.com').intercept({ path: '/index.m3u8' }).reply(200, manifest);
+    await seedUser('manifest-binding-owner', 'password123');
+    const owner = await env.DB.prepare("SELECT id FROM users WHERE username = 'manifest-binding-owner'").first<{ id: number }>();
+    const marker = randomHex(32);
+    const now = Math.floor(Date.now() / 1000);
+    await env.DB.prepare(
+      `INSERT INTO access_keys
+         (key_hash, key_prefix, label, username, user_id, status, max_devices, expires_at, created_at, updated_at)
+       VALUES (?, ?, 'binding-test', 'manifest-binding-owner', ?, 'active', 1, NULL, ?, ?)`,
+    )
+      .bind(marker, marker.slice(0, 12), owner!.id, now, now)
+      .run();
+    const key = await env.DB.prepare('SELECT id FROM access_keys WHERE key_hash = ?').bind(marker).first<{ id: number }>();
+    const token = await createToken(env.SECRET_KEY, {
+      u: 'https://bound.example.com/index.m3u8',
+      iat: now,
+      exp: now + 300,
+      k: 'm',
+      c: 'boundchannel001x',
+      ip: '198.51.100.7',
+      mac: 'AA:BB:CC:DD:EE:FF',
+      uid: owner!.id,
+      aid: key!.id,
+    });
+
+    const res = await SELF.fetch(`${BASE}/hls/${token}.m3u8`, {
+      headers: { 'CF-Connecting-IP': '198.51.100.7' },
+    });
+    expect(res.status).toBe(200);
+    const segmentUrl = (await res.text()).split('\n').find((line) => line.includes('/seg/'))!;
+    const segmentToken = segmentUrl.match(/\/seg\/([^.]+)\.ts$/)![1]!;
+    const segmentVerdict = await verifyToken(env.SECRET_KEY, segmentToken);
+    expect(segmentVerdict.ok).toBe(true);
+    if (segmentVerdict.ok) {
+      expect(segmentVerdict.payload).toMatchObject({
+        ip: '198.51.100.7',
+        mac: 'AA:BB:CC:DD:EE:FF',
+        uid: owner!.id,
+        aid: key!.id,
+        c: 'boundchannel001x',
+        k: 's',
+      });
+    }
+
+    const stolenSegment = await SELF.fetch(segmentUrl, {
+      headers: { 'CF-Connecting-IP': '198.51.100.8' },
+    });
+    expect(stolenSegment.status).toBe(403);
+    expect(((await stolenSegment.json()) as { error: string }).error).toBe('TOKEN_BINDING_MISMATCH');
   });
 
   it('resolves relative URIs against the FINAL URL after a redirect', async () => {
@@ -524,7 +1260,51 @@ describe('HLS proxy', () => {
     expect(body).not.toContain('deadfb');
   });
 
-  it('302-redirects the player to a fallback on a port Workers cannot fetch', async () => {
+  it('fails an unsupported-port primary over to a proxyable fallback without fetching or disclosing the primary', async () => {
+    const primary = 'http://origin.example.com:30113/live/index.m3u8';
+    const fallbackManifest = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nfallback.ts\n#EXT-X-ENDLIST\n';
+    fetchMock.get('https://strict-fallback.example.com').intercept({ path: '/index.m3u8' }).reply(200, fallbackManifest);
+    const token = await mintToken(primary, { channel: 'strictfallback01x' });
+    const res = await handleHlsManifest(
+      new Request(`${BASE}/hls/${token}.m3u8`),
+      { ...env, FALLBACK_M3U_URL: 'https://strict-fallback.example.com/index.m3u8' },
+      'req-strict-primary-fallback',
+      token,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Location')).toBeNull();
+    expect(res.headers.get('X-CHRTV-Fallback')).toBe('1');
+    const body = await res.text();
+    expect(body).toContain(`${BASE}/seg/`);
+    expect(body).not.toContain(primary);
+    expect(body).not.toContain('origin.example.com');
+    expect(body).not.toContain('strict-fallback.example.com');
+  });
+
+  it('does not extend fallback descendant capabilities beyond the parent expiry', async () => {
+    const fallbackManifest = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nfallback.ts\n#EXT-X-ENDLIST\n';
+    fetchMock.get('https://exp-fallback.example.com').intercept({ path: '/index.m3u8' }).reply(200, fallbackManifest);
+    fetchMock.get('https://exp-dead.example.com').intercept({ path: '/gone.m3u8' }).reply(404, 'not found');
+    const parentExpiry = Math.floor(Date.now() / 1000) + 45;
+    const token = await mintToken('https://exp-dead.example.com/gone.m3u8', {
+      channel: 'fallbackexpiry01x',
+      exp: parentExpiry,
+    });
+    const res = await handleHlsManifest(
+      new Request(`${BASE}/hls/${token}.m3u8`),
+      { ...env, FALLBACK_M3U_URL: 'https://exp-fallback.example.com/index.m3u8' },
+      'req-fallback-expiry',
+      token,
+    );
+    expect(res.status).toBe(200);
+    const segmentUrl = (await res.text()).split('\n').find((line) => line.includes('/seg/'))!;
+    const segmentToken = segmentUrl.match(/\/seg\/([^.]+)\.ts$/)![1]!;
+    const verdict = await verifyToken(env.SECRET_KEY, segmentToken);
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) expect(verdict.payload.exp).toBe(parentExpiry);
+  });
+
+  it('skips an unsupported-port fallback without revealing its origin', async () => {
     fetchMock.get('https://deadport.example.com').intercept({ path: '/gone.m3u8' }).reply(404, 'not found');
     const token = await mintToken('https://deadport.example.com/gone.m3u8', { channel: 'portchannel0001x' });
     const res = await handleHlsManifest(
@@ -533,9 +1313,13 @@ describe('HLS proxy', () => {
       'req-fallback-redirect',
       token,
     );
-    expect(res.status).toBe(302);
-    expect(res.headers.get('Location')).toBe('http://chrtv.duckdns.org:30113/hls/index.m3u8');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Location')).toBeNull();
     expect(res.headers.get('X-CHRTV-Fallback')).toBe('1');
+    const body = await res.text();
+    expect(body).toContain('#EXT-X-ENDLIST');
+    expect(body).not.toContain('chrtv.duckdns.org');
+    expect(body).not.toContain(':30113');
   });
 
   it('prefers a proxyable fallback over an unfetchable-port one', async () => {
@@ -560,7 +1344,7 @@ describe('HLS proxy', () => {
     expect(body).not.toContain('fb2.example.com');
   });
 
-  it('falls through to the redirect when the proxyable fallback is dead', async () => {
+  it('fails closed when proxyable fallbacks are dead and remaining ports are unsupported', async () => {
     fetchMock.get('https://fb3.example.com').intercept({ path: '/hls/index.m3u8' }).reply(500, 'boom');
     fetchMock.get('https://deadchain.example.com').intercept({ path: '/gone.m3u8' }).reply(404, 'not found');
 
@@ -574,8 +1358,12 @@ describe('HLS proxy', () => {
       'req-fallback-chain',
       token,
     );
-    expect(res.status).toBe(302);
-    expect(res.headers.get('Location')).toContain(':30113');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Location')).toBeNull();
+    const body = await res.text();
+    expect(body).toContain('#EXT-X-ENDLIST');
+    expect(body).not.toContain('chrtv.duckdns.org');
+    expect(body).not.toContain(':30113');
   });
 
   it('falls back to the empty error manifest when FALLBACK_M3U_URL is unset', async () => {
@@ -601,30 +1389,33 @@ describe('HLS proxy', () => {
     expect(second.headers.get('X-CHRTV-Fallback')).toBe('1');
   });
 
-  it('/live/{user}/{pass}/{id}.m3u8 serves the rewritten channel manifest', async () => {
+  it('/live/{user}/{pass}/{id}.m3u8 exchanges credentials for an opaque live URL', async () => {
     await seedChannels();
     await seedUser('bob', 'password123');
-    const manifest = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\ns1.ts\n#EXT-X-ENDLIST\n';
-    fetchMock.get('https://up.example.com').intercept({ path: '/live/vtv1/index.m3u8' }).reply(200, manifest);
-    const res = await SELF.fetch(`${BASE}/live/bob/password123/100001.m3u8`);
-    expect(res.status).toBe(200);
-    const body = await res.text();
-    expect(body).toContain('/seg/');
-    expect(body).not.toContain('up.example.com');
+    const res = await SELF.fetch(`${BASE}/live/bob/password123/100001.m3u8`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    const location = res.headers.get('Location')!;
+    expect(location).toMatch(/^https:\/\/chrtv\.example\.com\/hls\/.+\.m3u8$/);
+    expect(location).not.toContain('bob');
+    expect(location).not.toContain('password123');
+    expect(location).not.toContain('up.example.com');
+    const token = location.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+    const verdict = await verifyToken(env.SECRET_KEY, token);
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) expect(verdict.payload.u).toBe('https://up.example.com/live/vtv1/index.m3u8');
 
-    const bad = await SELF.fetch(`${BASE}/live/bob/wrongpass/100001.m3u8`);
+    const bad = await SELF.fetch(`${BASE}/live/bob/wrongpass/100001.m3u8`, { redirect: 'manual' });
     expect(bad.status).toBe(401);
-    const missing = await SELF.fetch(`${BASE}/live/bob/password123/999999.m3u8`);
+    const missing = await SELF.fetch(`${BASE}/live/bob/password123/999999.m3u8`, { redirect: 'manual' });
     expect(missing.status).toBe(404);
   });
 
-  it('the bare /{user}/{pass}/{id} form works too (portal URL without /live)', async () => {
+  it('the bare /{user}/{pass}/{id} form also redirects to an opaque URL', async () => {
     await seedChannels();
-    const manifest = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\ns1.ts\n#EXT-X-ENDLIST\n';
-    fetchMock.get('https://up.example.com').intercept({ path: '/live/vtv2/index.m3u8' }).reply(200, manifest);
-    const res = await SELF.fetch(`${BASE}/bareuser/barepass/100002.m3u8`);
-    expect(res.status).toBe(200);
-    expect(await res.text()).toContain('/seg/');
+    await seedUser('bareuser', 'barepass123');
+    const res = await SELF.fetch(`${BASE}/bareuser/barepass123/100002.m3u8`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toMatch(/^https:\/\/chrtv\.example\.com\/hls\/.+\.m3u8$/);
   });
 
   it('does not let the bare live route shadow the admin API or other routes', async () => {
@@ -634,7 +1425,7 @@ describe('HLS proxy', () => {
     expect(notFound.status).toBe(404);
   });
 
-  it('/live/{user}/{pass}/{id}.m3u8 redirects 302 for channels on custom ports', async () => {
+  it('/live/{user}/{pass}/{id}.m3u8 keeps custom-port channel origins hidden', async () => {
     await seedChannels();
     const now = Math.floor(Date.now() / 1000);
     await env.DB.prepare(
@@ -645,7 +1436,15 @@ describe('HLS proxy', () => {
 
     const res = await SELF.fetch(`${BASE}/live/bob/password123/100004.m3u8`, { redirect: 'manual' });
     expect(res.status).toBe(302);
-    expect(res.headers.get('Location')).toBe('http://chrtv.duckdns.org:18483/stream/cg_hbofam/index.m3u8');
+    const opaque = res.headers.get('Location')!;
+    expect(opaque).toMatch(/^https:\/\/chrtv\.example\.com\/hls\/.+\.m3u8$/);
+    const stream = await SELF.fetch(opaque, { redirect: 'manual' });
+    expect(stream.status).toBe(200);
+    expect(stream.headers.get('Location')).toBeNull();
+    const body = await stream.text();
+    expect(body).toContain('#EXT-X-ENDLIST');
+    expect(body).not.toContain('chrtv.duckdns.org');
+    expect(body).not.toContain(':18483');
   });
 });
 
@@ -688,6 +1487,18 @@ describe('media segment proxy', () => {
     const res = await SELF.fetch(`${BASE}/seg/${token}.ts`);
     expect(res.status).toBe(502);
     expect(res.headers.get('Content-Type')).toContain('json');
+  });
+
+  it('fails closed for unsupported-port media without a raw Location header', async () => {
+    const upstream = 'http://origin.example.com:30113/media/segment.ts';
+    const now = Math.floor(Date.now() / 1000);
+    const token = await createToken(env.SECRET_KEY, { u: upstream, iat: now, exp: now + 300, k: 's' });
+    const res = await SELF.fetch(`${BASE}/seg/${token}.ts`, { redirect: 'manual' });
+    expect(res.status).toBe(502);
+    expect(res.headers.get('Location')).toBeNull();
+    const body = await res.text();
+    expect(body).not.toContain(upstream);
+    expect(body).not.toContain('origin.example.com');
   });
 
   it('rejects invalid segment tokens with 403', async () => {
@@ -768,15 +1579,40 @@ describe('playlist sync', () => {
 });
 
 describe('EPG', () => {
-  it('serves minimal valid XMLTV when no source is configured', async () => {
+  it('serves XMLTV only through a dedicated token exposed by M3U', async () => {
     await seedChannels();
-    const res = await SELF.fetch(`${BASE}/xmltv.php`);
+    const ip = '192.0.2.241';
+    const playlist = await SELF.fetch(`${BASE}/tv.m3u`, { headers: { 'CF-Connecting-IP': ip } });
+    const text = await playlist.text();
+    const epgUrl = text.match(/url-tvg="([^"]+)"/)![1]!;
+    expect(epgUrl).toMatch(/^https:\/\/chrtv\.example\.com\/epg\/.+\.xml$/);
+    expect(epgUrl).not.toContain('epg.io.vn');
+    const token = epgUrl.match(/\/epg\/([^.]+)\.xml$/)![1]!;
+    const verdict = await verifyToken(env.SECRET_KEY, token);
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) expect(verdict.payload).toMatchObject({ k: 'e', ip });
+
+    const res = await SELF.fetch(epgUrl, { headers: { 'CF-Connecting-IP': ip } });
     expect(res.status).toBe(200);
     expect(res.headers.get('Content-Type')).toContain('xml');
     const body = await res.text();
     expect(body).toContain('<?xml');
     expect(body).toContain('<tv');
     expect(body).toContain('</tv>');
+  });
+
+  it('rejects media-token substitution and exchanges valid Xtream credentials for an EPG token', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const media = await createToken(env.SECRET_KEY, {
+      u: 'https://epg-token.chrtv.invalid/xmltv.xml', iat: now, exp: now + 300, k: 'm',
+    });
+    expect((await SELF.fetch(`${BASE}/epg/${media}.xml`)).status).toBe(403);
+    expect((await SELF.fetch(`${BASE}/xmltv.php`)).status).toBe(401);
+
+    await seedUser('epguser', 'epgpass123');
+    const redirect = await SELF.fetch(`${BASE}/xmltv.php?username=epguser&password=epgpass123`, { redirect: 'manual' });
+    expect(redirect.status).toBe(302);
+    expect(redirect.headers.get('Location')).toMatch(/^https:\/\/chrtv\.example\.com\/epg\/.+\.xml$/);
   });
 });
 
@@ -850,7 +1686,7 @@ describe('channel health probe', () => {
     expect(r).toMatchObject({ status: 'offline', errorCode: 'UPSTREAM_UNREACHABLE' });
   });
 
-  it('marks a channel on a Workers-unfetchable port as unknown (player streams it directly)', async () => {
+  it('marks a channel on a Workers-unfetchable port as unknown without fetching it', async () => {
     const r = await probeChannel('http://hprobe.example.com:30113/x.m3u8');
     expect(r).toMatchObject({ status: 'unknown', errorCode: 'UNSUPPORTED_PORT' });
   });

@@ -29,34 +29,60 @@ GitHub M3U (playlists/tv.m3u)
       ▼
  sync: fetch → hash check → parse → validate → normalize
       ▼
- Cloudflare D1 (channels, categories, users, keys, devices, logs)
+ Cloudflare D1 (channels, categories, users, sessions, keys, devices, auth logs)
       ▼
- /tv.m3u   /player_api.php   /get.php   /live/{u}/{p}/{id}   /xmltv.php
+ /tv.m3u   POST /api/login → /p/{session}.m3u   /lg/{u}?{p}.m3u   Xtream API
       ▼
+ /epg/{token}.xml   ── EPG token riêng, bind cùng identity
  /hls/{token}.m3u8  ── rewrite manifest, re-tokenize mọi URI
- /seg/{token}.ts    ── stream passthrough (Range/206, không buffer)
+ /seg/{token}.ts    ── segment/key/subtitle passthrough (Range/206, không buffer)
       ▼
  upstream chết? → HLS error manifest hợp lệ (không bao giờ trả HTML cho player)
 ```
 
-- **Token**: AES-256-GCM, chứa upstream URL + iat/exp, tamper-proof, tự hết hạn. Upstream URL không bao giờ lộ ra ngoài.
+- **Token**: AES-256-GCM, chứa upstream URL + iat/exp và identity đã xác thực (`IP`, `MAC`, `user_id`, `access_key_id`, `session_id` khi có), tamper-proof, tự hết hạn. Token con trong manifest kế thừa cùng identity; khi bật claim `ip`, token lấy từ IP khác bị chặn `403 TOKEN_BINDING_MISMATCH`. Mỗi lần tải manifest/EPG còn kiểm tra lại trạng thái user/key/session để revoke có hiệu lực trước khi chạm upstream. Upstream URL không xuất hiện trong playlist.
 - **SSRF guard**: chỉ http/https public; chặn localhost, private IP, link-local, metadata endpoints — kiểm tra cả từng hop redirect.
 - **Circuit breaker**: upstream fail → failure state TTL 30s trong Cloudflare Cache; trong TTL trả ngay fallback manifest, hết TTL tự retry.
 - **Channel health sweep**: cron `*/10 * * * *` chủ động probe batch kênh nhỏ (ưu tiên chưa check), đánh dấu `channel_health` online/offline/unknown → lộ ra qua `/api/admin/offline` + `health_status` ở `/api/admin/channels`. `offline` **chỉ khi link thật sự không vô được** (host không tới được, **im lặng quá 30s**, 404/410) và phải fail như vậy **2 lượt probe liên tiếp** mới chốt. Mọi trường hợp server vẫn trả lời — 5xx, 401/403/429/451 (auth/geo-block/rate-limit), 200 + body không phải HLS (trang anti-bot), port Worker không fetch được — đều là `unknown`, không bao giờ gán offline sai.
 - **Playlist sync an toàn**: playlist mới lỗi → giữ nguyên version cũ, đánh dấu sync failed. Hash không đổi → không ghi lại DB.
+- **Session login an toàn**: `POST /api/login` đổi username/password thành URL
+  `/p/{opaque-token}.m3u` không chứa password. Server chỉ lưu HMAC của token;
+  session sống tới `users.expires_at` hoặc khi user/session bị revoke, đồng thời
+  tuân thủ `max_connections` và hỗ trợ thay session cũ nhất.
+- **Audit xác thực**: login, tải M3U và dùng access key/Xtream được ghi bền vững
+  vào `auth_events`, gồm user/session, outcome, user-agent và **IP thô do
+  Cloudflare quan sát** theo yêu cầu vận hành; tự dọn sau 30 ngày.
+- **Honeypot + ban scanner**: các target scan lỗ hổng rõ ràng như `/.env`, `/.git/*`,
+  `/wp-login.php`, `/phpmyadmin/*` trả 404 giả và ban IP edge quan sát được trong
+  24 giờ. Bảng ban/counter chỉ giữ HMAC-SHA256 của IP. Request mà browser khai
+  rõ `Sec-Fetch-Site: cross-site` vẫn nhận 404 giả nhưng không tạo ban, nên link
+  hoặc embed độc hại từ site khác không thể ban nạn nhân. Scanner trực tiếp
+  (không có Fetch Metadata) vẫn bị ban. Các path IPTV thường bị app probe
+  (`/portal.php`, Stalker, Xtream) không nằm trong trap.
+- **Private login chống brute-force**: `/lg/{username}?{password}.m3u` luôn xác
+  thực user D1 dù playlist public đang bật. Năm lần sai trong 10 phút từ cùng IP
+  tạo ban 24 giờ; counter bền vững qua các Cloudflare colo.
 
 ## Routes
 
 | Route | Mô tả |
 |---|---|
-| `GET /` | Landing page (dark, minimal) |
-| `GET /tv.m3u`, `/xem.m3u` | Playlist chính (tuỳ chọn `?key=chr_…&mac=AA:BB:…`) |
-| `GET /hls/{token}.m3u8` | HLS manifest proxy (rewrite + re-tokenize) |
-| `GET /seg/{token}[.ext]` | Media passthrough (ts/m4s/aac/mp4/key/vtt) |
-| `GET /player_api.php` | Xtream Codes API (`get_live_categories`, `get_live_streams`, …) |
-| `GET /get.php` | Xtream M3U download |
-| `GET /live/{user}/{pass}/{id}.m3u8` | Xtream live stream |
-| `GET /xmltv.php`, `/epg.xml` | XMLTV EPG (cache 30′, fallback minimal hợp lệ) |
+| `GET /` | Landing page (dark, minimal; không quảng bá URL playlist public) |
+| `GET /login` | Portal user: đăng nhập, copy M3U, xem/revoke session/device |
+| `GET /admin` | Dashboard bảo mật: users, sessions, audit, bans, keys/devices, health/sync |
+| `GET /tv.m3u`, `/xem.m3u` | Playlist public chính (tuỳ chọn `?key=chr_…&mac=AA:BB:…`; token tự bind IP/MAC/key/user) |
+| `POST /api/login` | Đổi credential D1 thành opaque session và URL `/p/{token}.m3u` |
+| `GET /api/account/sessions` | Liệt kê session của user hiện tại (Bearer session token) |
+| `DELETE /api/account/sessions/{id}` | Revoke một session thuộc user hiện tại |
+| `GET /p/{session}.m3u` | Playlist session không chứa username/password |
+| `GET /lg/{username}?{password}.m3u` | Playlist riêng legacy; bắt buộc user/password D1, token bind user/IP |
+| `GET /epg/{token}.xml` | XMLTV qua token EPG riêng, có expiry/identity binding |
+| `GET /hls/{token}.m3u8` | HLS manifest proxy (rewrite + re-tokenize mọi URI con) |
+| `GET /seg/{token}[.ext]` | Media passthrough (ts/m4s/aac/mp4/key/vtt/subtitle) |
+| `GET /player_api.php` | Xtream Codes API; luôn bắt buộc user D1 thật |
+| `GET /get.php` | Xtream M3U; luôn bắt buộc user D1 thật |
+| `GET /live/{user}/{pass}/{id}.m3u8` | Đổi Xtream credential thành redirect tới URL live opaque |
+| `GET /xmltv.php`, `/epg.xml` | Đổi Xtream credential thành redirect tới EPG tokenized |
 | `* /api/admin/*` | Admin API (Bearer `ADMIN_TOKEN`) |
 | `GET /healthz` | Health check |
 | còn lại | 404 “Signal Lost” |
@@ -73,21 +99,139 @@ POST   /api/admin/sync              # trigger sync (chống concurrent, 409 khi 
 GET    /api/admin/sync-logs
 GET    /api/admin/failures          # kênh lỗi gần đây (log phản ứng khi viewer bật)
 DELETE /api/admin/failures/{channelId}   # reset failure state
+GET    /api/admin/security-bans     # ban còn hiệu lực; chỉ có HMAC IP, không có IP thô
+DELETE /api/admin/security-bans/{ipHash} # gỡ ban (propagate cache toàn cầu trong ≤60s)
+GET    /api/admin/auth-events[?limit=N]  # login/M3U/Xtream/access-key audit, có IP thô
+GET    /api/admin/sessions          # session/device user, IP đầu/cuối, trạng thái
+DELETE /api/admin/sessions/{id}     # revoke session bất kỳ
 GET    /api/admin/offline           # kênh đang bị đánh dấu offline (health sweep)
 POST   /api/admin/health-check[?limit=N] # chủ động probe một batch kênh ngay
 GET    /api/admin/users             # không bao giờ trả password hash
-POST   /api/admin/users             # {username, password, expires_at?}
-PATCH  /api/admin/users/{id}        # {status: active|disabled|expired|revoked}
-DELETE /api/admin/users/{id}        # revoke
+POST   /api/admin/users             # {username, password, expires_at?, max_connections?}
+PATCH  /api/admin/users/{id}        # {status?, expires_at?, max_connections: 1..100}
+DELETE /api/admin/users/{id}        # đánh dấu user revoked và revoke session đang active
 GET    /api/admin/keys
-POST   /api/admin/keys              # trả raw key đúng MỘT lần: chr_…
-PATCH  /api/admin/keys/{id}
+POST   /api/admin/keys              # {label?, max_devices?, user_id?}; trả raw key đúng MỘT lần
+PATCH  /api/admin/keys/{id}         # {status?} và/hoặc {user_id: number|null}
 DELETE /api/admin/keys/{id}
 GET    /api/admin/devices
 GET    /api/admin/devices/mac/{mac}
 PATCH  /api/admin/devices/{id}
 DELETE /api/admin/devices/{id}
 ```
+
+Dashboard tại `https://YOUR_DOMAIN/admin` gọi các API trên cùng origin. Nhập
+`ADMIN_TOKEN` trong browser; token được giữ trong `sessionStorage`, không được
+nhúng vào HTML/source. Dashboard hỗ trợ user/expiry/connection limit, session
+revoke, ban/unban, audit login với raw IP, access key/device, health check và
+playlist sync. Vì audit chứa dữ liệu cá nhân (IP thô), chỉ cấp `ADMIN_TOKEN` cho
+người vận hành và giữ retention mặc định 30 ngày.
+
+### Đăng nhập an toàn và quản lý session/device
+
+Mở `https://YOUR_DOMAIN/login`, hoặc gọi API trực tiếp:
+
+```bash
+curl -X POST https://YOUR_DOMAIN/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"ken","password":"use-a-strong-password","device_name":"TV phòng khách"}'
+```
+
+Kết quả `201` trả `access_token`, `playlist_url` dạng
+`https://YOUR_DOMAIN/p/{opaque-token}.m3u` và metadata session. URL M3U không chứa
+username/password; D1 chỉ lưu `HMAC-SHA256(token)` và prefix không bí mật, không
+lưu raw token. Response login/account/playlist luôn `private, no-store` và
+`Referrer-Policy: no-referrer`.
+
+- Session không có TTL 30 ngày riêng: hạn của nó là `users.expires_at` (hoặc vô
+  hạn nếu account chưa đặt hạn). Playlist dùng mốc sớm hơn giữa hạn session đang
+  lưu và hạn account hiện tại; media/EPG cùng mọi token HLS con không bao giờ
+  vượt mốc đó. Mỗi lần tải manifest/EPG kiểm tra lại D1 nên session/user bị revoke,
+  disabled, expired hoặc deleted sẽ dừng trước khi Worker gọi upstream.
+- `max_connections` (1–100) giới hạn số session active. Nếu đã đầy, API trả
+  `409 SESSION_LIMIT`; gửi `"replace_oldest": true` để revoke session dùng lâu
+  nhất rồi tạo session mới.
+- `GET /api/account/sessions` với `Authorization: Bearer {access_token}` liệt kê
+  thiết bị/session của đúng user đó; `DELETE /api/account/sessions/{id}` chỉ
+  revoke được session cùng owner. Admin có thể xem/revoke toàn bộ tại `/admin`.
+- Portal giữ bearer token trong `sessionStorage` của browser, không nhúng secret
+  vào HTML và không đưa password vào URL. Với IPTV player không hỗ trợ POST, đăng
+  nhập một lần trên portal rồi copy `playlist_url`.
+
+Ví dụ liệt kê session:
+
+```bash
+curl -H "Authorization: Bearer $ACCESS_TOKEN" \
+  https://YOUR_DOMAIN/api/account/sessions
+```
+
+### Playlist riêng legacy qua `/lg`
+
+Tạo user D1 qua Admin API (password tối thiểu 8 ký tự), sau đó dùng URL dạng:
+
+```text
+https://YOUR_DOMAIN/lg/ken?use-a-strong-password.m3u
+```
+
+Phần ngay sau dấu `?` tới trước suffix `.m3u` là password, **không** phải query
+`password=...`. Username/password có ký tự reserved phải percent-encode. Route
+này không nhận guest: nó luôn gọi user D1 và kiểm tra trạng thái/hạn dùng, kể cả
+khi `PUBLIC_PLAYLIST="true"`. M3U trả về chỉ chứa token opaque được bind với
+`user_id` đã xác thực và IP Cloudflare quan sát (theo `TOKEN_BINDING`). Response
+là `private, no-store` và không referrer; CHRTV không ghi query/password vào log.
+
+Sai credential trả cùng một `AUTH_INVALID` để không lộ username tồn tại. Counter
+brute-force lưu theo HMAC của IP trong D1: **5 lần sai / 10 phút** sẽ ban IP một
+ngày. Lần thứ 5 trả `429`, các request sau trả `403 SECURITY_BANNED` tới khi hết
+hạn hoặc admin gọi `DELETE /api/admin/security-bans/{ipHash}`.
+
+> Credential nằm trong URL theo format yêu cầu nên có thể xuất hiện trong access
+> log của hạ tầng phía trước Worker. Luôn dùng HTTPS, password mạnh/riêng và hạn
+> chế chia sẻ URL.
+
+### Token theo IP / MAC / user ID
+
+Mỗi lần trả M3U, CHRTV tạo identity binding từ địa chỉ edge quan sát được,
+credential đã xác thực và device label do client khai. Các claim được bật bằng
+`TOKEN_BINDING` (mặc định `"ip,mac,user,key"`):
+
+- `ip`: lấy duy nhất từ header edge tin cậy `CF-Connecting-IP` (không tin
+  `X-Forwarded-For`). Mọi request `/hls` và `/seg` phải đến từ đúng IP này;
+  khác IP trả `403 TOKEN_BINDING_MISMATCH` trước khi chạm upstream.
+- `mac`: lấy từ `?mac=`, normalize về `AA:BB:CC:DD:EE:FF`, đồng thời đăng ký
+  device nếu playlist dùng access key. MAC, IP và các ID đều nằm **bên trong
+  payload AES-GCM**, không lộ plaintext trong URL.
+- `user_id`: lấy từ user D1 đã đăng nhập qua Xtream, hoặc từ access key được
+  link user bằng `user_id`. Client không thể tự khai `user_id` qua query.
+- `access_key_id`: tự gắn khi dùng `?key=chr_…`, nên ngay cả hai key cùng
+  IP/MAC vẫn nhận token khác nhau.
+- `session_id`: luôn gắn cùng owner `user_id` vào playlist từ `/p/{session}.m3u`,
+  kể cả khi operator đặt `TOKEN_BINDING=none`; đây là capability phục vụ revoke,
+  không phải claim tùy chọn do client khai.
+
+Các token manifest/segment sinh tiếp theo kế thừa đủ binding trên. Playlist còn
+đưa `url-tvg`/`x-tvg-url` về `/epg/{token}.xml`; token EPG có kind riêng nên
+không thể lấy token manifest/segment thế vào. URI con trong HLS — child manifest,
+segment, encryption key, init map và subtitle — đều phải rewrite thành token;
+nếu một URI không an toàn hoặc không token hóa được, CHRTV fail closed và trả
+fallback HLS an toàn thay vì lộ URL upstream.
+
+Token vẫn ổn định trong cửa sổ 10 phút **cho cùng identity**, nhưng khác
+IP/MAC/user/key sẽ khác nhau. Request playlist bằng access key đã link cũng bị
+từ chối khi user owner bị disable, revoked hoặc hết hạn. Access key link user có
+thể tạo bằng:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"label":"TV phòng khách","user_id":12,"max_devices":2}' \
+  https://YOUR_DOMAIN/api/admin/keys
+```
+
+> MAC phần cứng là thông tin layer 2, server HTTP trên Internet không thể tự
+> đọc nó. Vì vậy MAC ở đây là device identity do client khai báo, được ràng buộc
+> với access key và dùng để cá nhân hoá token/giới hạn thiết bị; credential thật
+> vẫn là access key. IP do Cloudflare quan sát mới là binding được kiểm tra độc lập.
 
 ### Phát hiện kênh offline (channel health)
 
@@ -145,7 +289,7 @@ npm install
 # 1. Tạo D1 database, điền database_id vào wrangler.toml
 npx wrangler d1 create chrtv-db
 
-# 2. Chạy migrations
+# 2. Chạy migrations (bao gồm 0005 token identity, 0006 bans, 0007 sessions/audit)
 npm run db:migrate          # remote
 npm run db:migrate:local    # local dev
 
@@ -163,15 +307,26 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" https://YOUR_DOMAIN/api/adm
 Cấu hình trong `wrangler.toml`:
 
 - `PLAYLIST_URL` — raw URL của `playlists/tv.m3u` trong repo này
-- `EPG_URL` — nguồn XMLTV (tuỳ chọn)
-- `PUBLIC_PLAYLIST` — `"true"` (mặc định): `/tv.m3u` mở tự do; `"false"`: bắt buộc `?key=`
+- `EPG_URL` — nguồn XMLTV upstream (tuỳ chọn); URL này không lộ cho client,
+  playlist chỉ nhận `/epg/{token}.xml`
+- `PUBLIC_PLAYLIST` — `"true"` (mặc định): chỉ `/tv.m3u`/`xem.m3u` mở tự do;
+  `"false"`: bắt buộc `?key=`. Biến này **không** cho phép Xtream hoặc login
+  dùng credential tuỳ ý; các endpoint đó luôn xác thực user thật trong D1
+- `TOKEN_BINDING` — danh sách claim phân cách bằng dấu phẩy: `ip`, `mac`, `user`, `key`.
+  Mặc định `"ip,mac,user,key"`; có thể chọn riêng, ví dụ `"ip,user"` hoặc
+  `"mac,user,key"`. `"none"` tắt identity binding có chủ đích. Giá trị sai tự
+  fail-safe về mặc định đầy đủ, không âm thầm tắt bảo vệ.
+- `HONEYPOT_ENABLED` — mặc định `"true"`; đặt `"false"` chỉ để tắt nhận diện
+  scanner trap. Ban đã tồn tại và brute-force protection vẫn tiếp tục áp dụng.
+- `HONEYPOT_BAN_SECONDS` — thời gian ban honeypot/brute-force, mặc định `86400`
+  (một ngày), tối thiểu 60 giây và clamp tối đa 7 ngày.
 - `FALLBACK_M3U_URL` — (tuỳ chọn) playlist HLS phát thay khi kênh chết. Cho phép **nhiều URL,
   ngăn cách bằng dấu phẩy**, thử lần lượt:
   1. URL nằm trên port Worker fetch được → CHRTV fetch + re-proxy (segment thành `/seg/{token}`),
      không lộ URL fallback, chạy được cả trên trang https.
-  2. URL nằm trên port Worker **không** fetch được (ví dụ `:30113`) → CHRTV **302 redirect thẳng
-     player** tới đó. Player trên thiết bị người dùng không bị giới hạn port nên vẫn phát bình thường.
-  3. Không có URL nào dùng được → manifest "signal lost" rỗng mặc định.
+  2. URL nằm trên port Worker **không** fetch được (ví dụ `:30113`) → bỏ qua, tuyệt đối không
+     redirect client tới origin thô.
+  3. Không có URL proxy được → manifest "signal lost" rỗng mặc định.
 - `HEALTH_CHECK_BATCH` — (tuỳ chọn) số kênh probe mỗi cron health sweep (`*/10 * * * *`).
   Luôn bị clamp về hard cap 12 (subrequest budget gói Free — xem phần Channel health),
   đặt lớn hơn cũng không quét nhanh hơn mà còn gây gán offline oan.
@@ -186,18 +341,27 @@ hoặc treo tới hết timeout → player báo **"connection is unstable"**:
 | `http:`  | 80, 8080, 8880, 2052, 2082, 2086, 2095 |
 | `https:` | 443, 8443, 2053, 2083, 2087, 2096 |
 
-CHRTV kiểm tra trước khi fetch:
+CHRTV kiểm tra trước khi fetch và áp dụng **strict origin hiding**:
 
-- URL kênh trong playlist dùng port không hợp lệ → **trả thẳng URL gốc** cho player (`/tv.m3u`)
-  hoặc **302 redirect** (`/live/...`), player tự phát trực tiếp.
-- URI trong manifest dùng port không hợp lệ → **không rewrite**, không proxy.
-- `FALLBACK_M3U_URL` dùng port không hợp lệ (ví dụ `:30113`) → **302 redirect player** tới URL đó
-  thay vì treo timeout hoặc im lặng trả manifest rỗng.
+- URL kênh trong playlist dùng port không hợp lệ → playlist vẫn chỉ chứa
+  `/hls/{token}`. Sau khi xác thực token + identity binding, Worker thử fallback
+  proxy được; nếu không có thì trả manifest "signal lost" hợp lệ. Response không
+  bao giờ chứa origin thô hoặc `Location` trỏ tới origin đó.
+- URI con trong manifest dùng port không hợp lệ → từ chối cả manifest trước khi
+  phát capability con, rồi failover/fail closed; không tạo URL con không dùng được.
+- `FALLBACK_M3U_URL` dùng port không hợp lệ (ví dụ `:30113`) → bỏ qua candidate,
+  không redirect player và không lộ URL trong response.
+
+Nguồn custom-port muốn tiếp tục phát phải được đặt sau **HTTPS port 443**, đưa qua
+**Cloudflare Tunnel**, hoặc qua một **relay riêng** trên port Worker fetch được.
+CHRTV không dùng User-Agent/camouflage để chỉ che origin với scanner: cùng một luật
+không-disclosure áp dụng cho curl, player và trình duyệt.
 
 ### Chống "connection is unstable"
 
-- **Token ổn định**: cùng một segment/kênh luôn ra cùng một URL trong cửa sổ 10 phút
-  (IV suy ra bằng HMAC thay vì random) → player tái sử dụng buffer, không tải lại
+- **Token ổn định theo identity**: cùng một segment/kênh + IP/MAC/user/key luôn
+  ra cùng URL trong cửa sổ 10 phút (IV suy ra bằng HMAC trên cả seed + payload
+  thay vì random); identity khác nhận URL khác → player tái sử dụng buffer, không tải lại
   toàn bộ segment mỗi lần refresh manifest.
 - **Timeout 30s cho cả manifest lẫn segment**: relay chậm (devda.undo.it → CDN)
   load 10-25s vẫn vào kênh bình thường — chỉ khi upstream **im lặng quá 30s** mới
@@ -222,10 +386,11 @@ CHRTV kiểm tra trước khi fetch:
 
 ### Xtream Codes
 
-Khi `PUBLIC_PLAYLIST="true"`, client Xtream đăng nhập bằng **bất kỳ**
-username/password nào cũng được (kể cả để trống), vì playlist vốn đã mở.
-Nếu username trùng user có trong D1 thì vẫn phải đúng mật khẩu.
-Đặt `PUBLIC_PLAYLIST="false"` để bắt buộc tài khoản thật.
+Xtream **luôn yêu cầu user thật đang active trong D1**, bất kể
+`PUBLIC_PLAYLIST`. Credential sai/thiếu không được biến thành guest access;
+`/tv.m3u` là route duy nhất được phép public theo cấu hình. Login success,
+failure và blocked được ghi `auth_events` với raw client IP và áp dụng cùng
+brute-force ban như các flow username/password khác.
 
 CHRTV đọc thông tin đăng nhập từ **mọi cách client gửi**: query string,
 form POST, **JSON POST** (IPTV Smarters) và **HTTP Basic auth**.
@@ -238,20 +403,26 @@ Endpoint được hỗ trợ:
 | `/panel_api.php` | client cũ (trả nguyên `available_channels` + `categories`) |
 | `/get.php`, `/enigma2.php` | tải M3U |
 | `/live/{u}/{p}/{id}`, `/{u}/{p}/{id}` | phát kênh (dạng có và không có tiền tố `/live`) |
+| `/xmltv.php`, `/epg.xml` | EPG Xtream có credential |
+
+`get.php` và live records trong player API chỉ xuất URL media opaque. Route live
+có credential xác thực rồi redirect sang `/hls/{token}.m3u8`; XMLTV có credential
+redirect sang `/epg/{token}.xml`. Vì vậy password không truyền tiếp vào URI con,
+và upstream media/EPG không lộ qua response API.
 
 Cấu hình trong player:
 
 ```
 Server / Portal URL : https://YOUR_DOMAIN     (không thêm /get.php, không thêm port)
-Username            : bất kỳ
-Password            : bất kỳ
+Username            : user đã tạo trong D1
+Password            : password đúng của user
 ```
 
 ## Development & test
 
 ```bash
 npm run dev        # wrangler dev (cần .dev.vars, xem .dev.vars.example)
-npm test           # 110 tests (unit + integration, chạy trong workerd)
+npm test           # unit + integration, chạy trong workerd
 npm run typecheck
 npm run build      # wrangler deploy --dry-run
 ```

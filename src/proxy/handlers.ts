@@ -1,5 +1,5 @@
 import type { Env } from '../types';
-import { verifyToken } from '../token';
+import { requestMatchesTokenBinding, tokenBindingFromPayload, verifyToken, type TokenBinding } from '../token';
 import { ErrorCodes } from '../errors/codes';
 import { errorResponse, logEvent, methodNotAllowed, corsPreflight } from '../utils/http';
 import { fetchUpstream, passthroughResponse } from './upstream';
@@ -9,6 +9,7 @@ import { rewriteManifest, looksLikeHls, HlsError } from '../hls/rewrite';
 import { errorManifestResponse } from '../hls/errorManifest';
 import { getFailure, setFailure, recordFailure } from './failureCache';
 import { sha256Hex } from '../utils/crypto';
+import { isTokenAuthorizationActive } from '../auth/tokenAuthorization';
 
 /**
  * Stream proxy handlers.
@@ -39,8 +40,8 @@ async function failureKey(payload: { c?: string; u: string }): Promise<string> {
 /**
  * Fallback playlist candidates.
  * FALLBACK_M3U_URL may list several URLs (comma / whitespace separated); they
- * are tried in order, so an operator can put a proxyable https source first and
- * keep a custom-port one as the last resort.
+ * are tried in order. Only URLs the Worker can fetch are ever sent upstream;
+ * an unsupported-port origin is never disclosed to the client.
  */
 export function fallbackCandidates(env: Env): string[] {
   return (env.FALLBACK_M3U_URL ?? '')
@@ -51,48 +52,26 @@ export function fallbackCandidates(env: Env): string[] {
 }
 
 /**
- * Redirect the PLAYER straight to the fallback stream.
- * Used when the fallback lives on a port Cloudflare Workers cannot open a
- * subrequest to (e.g. :30113) — the worker can never fetch it, but the player
- * on the user's device has no such restriction, so a 302 makes the fallback
- * actually play instead of silently degrading to the empty "signal lost"
- * manifest. Same trick already used for channels on custom ports.
- */
-function fallbackRedirect(target: string, requestId: string): Response {
-  return new Response(null, {
-    status: 302,
-    headers: {
-      Location: target,
-      'Cache-Control': 'no-store',
-      'Access-Control-Allow-Origin': '*',
-      'X-Request-ID': requestId,
-      'X-CHRTV-Fallback': '1',
-    },
-  });
-}
-
-/**
  * Serve the fallback playlist when a channel upstream is dead.
- * 1. Any candidate on a Workers-fetchable port is fetched + rewritten, so the
- *    player gets a playable stream proxied through CHRTV (segments become
- *    /seg/{token}, everything stays on the worker origin — no mixed content).
- * 2. If no candidate could be proxied but one lives on a port the worker cannot
- *    reach, the player is 302-redirected to it and plays it directly.
- * 3. Only when nothing is configured/usable do we return the empty error
- *    manifest (a valid ENDED playlist) so players never get HTML.
+ * Fetchable candidates are fetched and fully rewritten so every media URL stays
+ * on CHRTV. Unsupported-port candidates are skipped rather than redirected:
+ * returning their raw Location would reveal the origin to curl, players, and
+ * scanners. If no candidate can be proxied, return the safe empty HLS manifest.
  */
-async function serveFallbackManifest(env: Env, req: Request, requestId: string): Promise<Response> {
+async function serveFallbackManifest(
+  env: Env,
+  req: Request,
+  requestId: string,
+  binding: TokenBinding = {},
+  channelId?: string,
+  absoluteExpiry?: number,
+): Promise<Response> {
   const candidates = fallbackCandidates(env);
   if (candidates.length === 0) return errorManifestResponse(requestId);
 
-  // Candidates the worker cannot fetch itself, kept for the redirect path.
-  const directOnly: string[] = [];
-
   for (const fallbackUrl of candidates) {
     if (!isFetchablePort(fallbackUrl)) {
-      // Fetching it would hang until the timeout on EVERY dead-channel request;
-      // hand it to the player instead (step 2 below).
-      directOnly.push(fallbackUrl);
+      logEvent(requestId, '/hls', 'FALLBACK_UNSUPPORTED_PORT', 'origin hidden');
       continue;
     }
 
@@ -120,6 +99,9 @@ async function serveFallbackManifest(env: Env, req: Request, requestId: string):
         secret: env.SECRET_KEY,
         baseUrl: upstream.finalUrl,
         publicOrigin: new URL(req.url).origin,
+        binding,
+        ...(channelId ? { channelId } : {}),
+        ...(absoluteExpiry !== undefined ? { absoluteExpiry } : {}),
       });
     } catch {
       continue;
@@ -137,11 +119,6 @@ async function serveFallbackManifest(env: Env, req: Request, requestId: string):
     });
   }
 
-  if (directOnly.length > 0) {
-    logEvent(requestId, '/hls', 'FALLBACK_REDIRECT', 'unsupported-port');
-    return fallbackRedirect(directOnly[0]!, requestId);
-  }
-
   return errorManifestResponse(requestId);
 }
 
@@ -157,18 +134,30 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
     return errorResponse(ErrorCodes[verdict.code], status, requestId);
   }
   const payload = verdict.payload;
+  // Token kinds are route capabilities, not hints. In particular, accepting a
+  // segment token on /hls would return an upstream manifest without rewriting,
+  // while accepting EPG/media tokens here would permit cross-route substitution.
+  if (payload.k !== 'm') {
+    logEvent(requestId, '/hls', ErrorCodes.TOKEN_INVALID, 'wrong token kind');
+    return errorResponse(ErrorCodes.TOKEN_INVALID, 403, requestId);
+  }
+  if (!requestMatchesTokenBinding(req, payload)) {
+    logEvent(requestId, '/hls', ErrorCodes.TOKEN_BINDING_MISMATCH);
+    return errorResponse(ErrorCodes.TOKEN_BINDING_MISMATCH, 403, requestId);
+  }
+  if (!(await isTokenAuthorizationActive(env, payload))) {
+    logEvent(requestId, '/hls', ErrorCodes.AUTH_DISABLED, 'revoked or expired token identity');
+    return errorResponse(ErrorCodes.AUTH_DISABLED, 403, requestId);
+  }
+  const binding = tokenBindingFromPayload(payload);
 
-  // Ports that Cloudflare Workers cannot open subrequests to are redirected
-  // directly so the client player can stream them directly.
+  // Never disclose an unsupported-port origin in a client-facing redirect.
+  // Such channels must be moved behind an HTTPS relay/Tunnel on a fetchable
+  // port; until then, use only a proxyable fallback or the safe error manifest.
   if (!isFetchablePort(payload.u)) {
-    return new Response(null, {
-      status: 302,
-      headers: {
-        Location: payload.u,
-        'Access-Control-Allow-Origin': '*',
-        'X-Request-ID': requestId,
-      },
-    });
+    logEvent(requestId, '/hls', ErrorCodes.UNSUPPORTED_PORT, 'origin hidden');
+    if (payload.c) await recordFailure(env.DB, payload.c, ErrorCodes.UNSUPPORTED_PORT, 0);
+    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp);
   }
 
   const fkey = await failureKey(payload);
@@ -177,7 +166,7 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
   const failed = await getFailure(fkey);
   if (failed) {
     logEvent(requestId, '/hls', 'CIRCUIT_OPEN', failed.code);
-    return serveFallbackManifest(env, req, requestId);
+    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp);
   }
 
   const upstream = await fetchUpstream(payload.u, req, 'GET', 'manifest');
@@ -185,7 +174,7 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
     logEvent(requestId, '/hls', upstream.code, `status=${upstream.status}`);
     await setFailure(fkey, { code: upstream.code, status: upstream.status, at: Date.now() });
     if (payload.c) await recordFailure(env.DB, payload.c, upstream.code, upstream.status);
-    return serveFallbackManifest(env, req, requestId);
+    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp);
   }
 
   let text: string;
@@ -193,14 +182,14 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
     text = await upstream.response.text();
   } catch {
     await setFailure(fkey, { code: ErrorCodes.UPSTREAM_UNREACHABLE, status: 0, at: Date.now() });
-    return serveFallbackManifest(env, req, requestId);
+    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp);
   }
 
   if (!looksLikeHls(text) || text.trim().length === 0) {
     logEvent(requestId, '/hls', ErrorCodes.INVALID_HLS);
     await setFailure(fkey, { code: ErrorCodes.INVALID_HLS, status: upstream.response.status, at: Date.now() });
     if (payload.c) await recordFailure(env.DB, payload.c, ErrorCodes.INVALID_HLS, upstream.response.status);
-    return serveFallbackManifest(env, req, requestId);
+    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp);
   }
 
   let rewritten: string;
@@ -209,10 +198,13 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
       secret: env.SECRET_KEY,
       baseUrl: upstream.finalUrl, // relative URIs resolve against the FINAL (post-redirect) URL
       publicOrigin: new URL(req.url).origin,
+      binding,
+      ...(payload.c ? { channelId: payload.c } : {}),
+      absoluteExpiry: payload.exp,
     });
   } catch (err) {
     logEvent(requestId, '/hls', ErrorCodes.INVALID_HLS, err instanceof HlsError ? err.message : 'rewrite failed');
-    return serveFallbackManifest(env, req, requestId);
+    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp);
   }
 
   return new Response(req.method === 'HEAD' ? null : rewritten, {
@@ -238,15 +230,18 @@ export async function handleSegment(req: Request, env: Env, requestId: string, r
     return errorResponse(ErrorCodes[verdict.code], status, requestId);
   }
 
+  if (verdict.payload.k !== 's') {
+    logEvent(requestId, '/seg', ErrorCodes.TOKEN_INVALID, 'wrong token kind');
+    return errorResponse(ErrorCodes.TOKEN_INVALID, 403, requestId);
+  }
+  if (!requestMatchesTokenBinding(req, verdict.payload)) {
+    logEvent(requestId, '/seg', ErrorCodes.TOKEN_BINDING_MISMATCH);
+    return errorResponse(ErrorCodes.TOKEN_BINDING_MISMATCH, 403, requestId);
+  }
+
   if (!isFetchablePort(verdict.payload.u)) {
-    return new Response(null, {
-      status: 302,
-      headers: {
-        Location: verdict.payload.u,
-        'Access-Control-Allow-Origin': '*',
-        'X-Request-ID': requestId,
-      },
-    });
+    logEvent(requestId, '/seg', ErrorCodes.UNSUPPORTED_PORT, 'origin hidden');
+    return errorResponse(ErrorCodes.UNSUPPORTED_PORT, 502, requestId);
   }
 
   const isHead = req.method === 'HEAD';

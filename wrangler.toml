@@ -8,7 +8,7 @@ compatibility_date = "2026-08-01"
 crons = [
   "*/15 * * * *", # playlist sync (skips work when hash unchanged)
   "*/10 * * * *", # channel health sweep (batch ≤12, subrequest-safe; offline = confirmed dead only)
-  "23 3 * * *",   # daily cleanup (old failures / sync logs / stale devices)
+  "23 3 * * *",   # daily cleanup (failures/logs/bans/auth events/expired sessions/devices)
 ]
 
 [[d1_databases]]
@@ -22,10 +22,20 @@ migrations_dir = "migrations"
 PLAYLIST_URL = "https://raw.githubusercontent.com/ankbuitv/mytv/refs/heads/main/playlist.m3u"
 # Optional XMLTV EPG source. Leave empty to serve a minimal valid XMLTV document.
 EPG_URL = "https://epg.io.vn/epgc.xml"
-# "true" => /tv.m3u works without an access key (still token-guarded streams, never an open proxy).
-# It also lets Xtream clients (TiviMate / Smarters / OTT Navigator) log in with
-# any username+password, so /get.php and /player_api.php work out of the box.
+# "true" => only /tv.m3u and /xem.m3u work without an access key (streams and
+# EPG remain tokenized; never an open proxy). Xtream, /lg, and POST /api/login
+# always require a real active D1 user regardless of this setting.
 PUBLIC_PLAYLIST = "true"
+# Claims embedded in stream tokens. Choose any comma-separated subset of
+# ip,mac,user,key; use "none" only when identity binding is intentionally off.
+# Invalid values fall back to this secure all-claims default.
+TOKEN_BINDING = "ip,mac,user,key"
+# Conservative scanner honeypots (/.env, /.git/*, wp-login.php, etc.). A direct
+# hit stores only an HMAC of CF-Connecting-IP in the ban tables for one day.
+# Browser-declared cross-site requests still get fake 404 but do not create a ban.
+# Separate auth_events intentionally retain raw client IP for 30 days.
+HONEYPOT_ENABLED = "true"
+HONEYPOT_BAN_SECONDS = "86400"
 # Fallback playlist served when a channel upstream is dead.
 # Accepts a comma-separated list; candidates are tried in order.
 # Empty => serve the built-in empty "signal lost" manifest instead.
@@ -33,13 +43,12 @@ PUBLIC_PLAYLIST = "true"
 # NOTE: Cloudflare Workers can only open subrequests on these ports —
 #   http:  80, 8080, 8880, 2052, 2082, 2086, 2095
 #   https: 443, 8443, 2053, 2083, 2087, 2096
-# Port 30113 is NOT in that list, so the Worker itself can never fetch this
-# fallback. CHRTV detects that up-front and, instead of hanging for the full
-# timeout, 302-redirects the PLAYER straight to it — the player has no port
-# restriction, so the fallback actually plays. Put a fallback on :80/:443/:8080
-# first in the list if you prefer it fully proxied (hides the URL, works for
-# https pages / web players).
-FALLBACK_M3U_URL = "http://chrtv.duckdns.org:30113/hls/index.m3u8"
+# Port 30113 is NOT in that list, so the Worker can never fetch it. Strict
+# origin hiding skips unsupported-port candidates instead of redirecting the
+# player and exposing the raw URL. Put custom-port sources behind HTTPS :443,
+# Cloudflare Tunnel, or a dedicated relay on a fetchable port before listing
+# them here. Empty => use the built-in safe "signal lost" manifest.
+FALLBACK_M3U_URL = ""
 ADMIN_TOKEN = "Q8vLm3Xz7Np2Ka9Rt5Yw4Hs6Bc1Df0Gj"
 SECRET_KEY = "7fK9mQ2xLp8VnR4cYt6Wz3AaHj5Ns0Bd"
 

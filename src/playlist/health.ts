@@ -29,8 +29,9 @@ import { logEvent } from '../utils/http';
  *  - 5xx: the server answered — it is having a moment, not a dead link;
  *  - 200 + non-HLS body: reachable, just serving something odd (often an
  *    anti-bot interstitial shown to the probe while real players stream fine);
- *  - ports the Worker cannot open a subrequest to (e.g. :30113) are played
- *    directly by the client, so the Worker cannot judge them;
+ *  - ports the Worker cannot open a subrequest to (e.g. :30113) cannot be
+ *    probed here, so they remain unknown; strict origin hiding also prevents
+ *    client redirects until the source is moved behind a fetchable relay;
  *  - 401/403/429/451 (auth / geo-block / rate-limit) depend on WHERE the probe
  *    runs. Cron triggers fire on an arbitrary Cloudflare colo, possibly
  *    outside the audience's country, so a 403 seen by the sweep proves nothing

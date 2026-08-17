@@ -1,6 +1,9 @@
 import type { Env } from '../types';
 import { isSafeUpstreamUrl } from '../utils/urlsafe';
-import { logEvent } from '../utils/http';
+import { corsPreflight, errorResponse, logEvent, mediaCors, methodNotAllowed } from '../utils/http';
+import { ErrorCodes } from '../errors/codes';
+import { requestMatchesTokenBinding, verifyToken } from '../token';
+import { isTokenAuthorizationActive } from '../auth/tokenAuthorization';
 
 /**
  * XMLTV / EPG service.
@@ -36,6 +39,37 @@ async function minimalXmltv(env: Env): Promise<string> {
   return `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE tv SYSTEM "xmltv.dtd">\n<tv generator-info-name="CHRTV">\n${body}\n</tv>\n`;
 }
 
+/** Verify a dedicated encrypted EPG token before serving cached/generated XMLTV. */
+export async function handleTokenizedXmltv(
+  req: Request,
+  env: Env,
+  requestId: string,
+  rawToken: string,
+): Promise<Response> {
+  if (req.method === 'OPTIONS') return corsPreflight();
+  if (req.method !== 'GET' && req.method !== 'HEAD') return methodNotAllowed(['GET', 'HEAD', 'OPTIONS'], requestId);
+  const token = rawToken.replace(/\.xml$/i, '');
+  if (rawToken !== `${token}.xml`) return errorResponse(ErrorCodes.TOKEN_INVALID, 403, requestId);
+  const verdict = await verifyToken(env.SECRET_KEY, token);
+  if (!verdict.ok || verdict.payload.k !== 'e') {
+    const code = verdict.ok ? ErrorCodes.TOKEN_INVALID : ErrorCodes[verdict.code];
+    return errorResponse(code, !verdict.ok && verdict.code === 'TOKEN_EXPIRED' ? 410 : 403, requestId);
+  }
+  if (!requestMatchesTokenBinding(req, verdict.payload)) {
+    return errorResponse(ErrorCodes.TOKEN_BINDING_MISMATCH, 403, requestId);
+  }
+  if (!(await isTokenAuthorizationActive(env, verdict.payload))) {
+    return errorResponse(ErrorCodes.AUTH_DISABLED, 403, requestId);
+  }
+  const response = await handleXmltv(req, env, requestId);
+  const headers = new Headers(response.headers);
+  headers.set('Cache-Control', 'private, max-age=1800');
+  headers.set('Referrer-Policy', 'no-referrer');
+  mediaCors(headers);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+/** Internal XMLTV producer; public routing should go through an EPG token. */
 export async function handleXmltv(req: Request, env: Env, requestId: string): Promise<Response> {
   const isHead = req.method === 'HEAD';
 

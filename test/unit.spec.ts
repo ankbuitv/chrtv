@@ -2,13 +2,54 @@ import { describe, it, expect } from 'vitest';
 import { normalizeMac } from '../src/utils/mac';
 import { isSafeUpstreamUrl } from '../src/utils/urlsafe';
 import { isFetchablePort } from '../src/utils/ports';
-import { createToken, verifyToken } from '../src/token';
+import { createToken, parseTokenBindingPolicy, requestTokenBinding, verifyToken } from '../src/token';
 import { parsePlaylist, PlaylistError } from '../src/playlist/parser';
 import { rewriteManifest, looksLikeHls, HlsError } from '../src/hls/rewrite';
 import { buildErrorManifest } from '../src/hls/errorManifest';
 import { hashPassword, hashAccessKey, timingSafeEqual, randomHex } from '../src/utils/crypto';
+import { isHoneypotPath, shouldBanHoneypotRequest } from '../src/security/honeypot';
+import { parsePrivateLogin } from '../src/auth/privateLogin';
 
 const SECRET = 'unit-test-secret-0123456789abcdef';
+
+describe('security route parsing', () => {
+  it('recognizes conservative vulnerability-scan traps, including encoded/case variants', () => {
+    for (const path of ['/.env', '/.env.production', '/.git/config', '/WP-LOGIN.php', '/phpMyAdmin/', '/%2eenv']) {
+      expect(isHoneypotPath(path)).toBe(true);
+    }
+  });
+
+  it('does not trap legitimate CHRTV, generic admin, or IPTV portal paths', () => {
+    for (const path of ['/', '/tv.m3u', '/api/admin/status', '/admin', '/portal.php', '/stalker_portal/server/load.php']) {
+      expect(isHoneypotPath(path)).toBe(false);
+    }
+  });
+
+  it('suppresses only browser-declared cross-site honeypot side effects', () => {
+    expect(shouldBanHoneypotRequest(new Request('https://chrtv.example/.env'))).toBe(true);
+    expect(
+      shouldBanHoneypotRequest(
+        new Request('https://chrtv.example/.env', { headers: { 'Sec-Fetch-Site': 'same-origin' } }),
+      ),
+    ).toBe(true);
+    expect(
+      shouldBanHoneypotRequest(
+        new Request('https://chrtv.example/.env', { headers: { 'Sec-Fetch-Site': 'cross-site' } }),
+      ),
+    ).toBe(false);
+  });
+
+  it('parses only the compact /lg/{username}?{password}.m3u form', () => {
+    expect(parsePrivateLogin(new URL('https://chrtv.example/lg/ken?strong%20password.m3u'))).toEqual({
+      username: 'ken',
+      password: 'strong password',
+    });
+    expect(parsePrivateLogin(new URL('https://chrtv.example/lg/ken?password=wrong.m3u'))).toBeNull();
+    expect(parsePrivateLogin(new URL('https://chrtv.example/lg/ken/password.m3u'))).toBeNull();
+    expect(parsePrivateLogin(new URL('https://chrtv.example/lg/ken%2Fother?password.m3u'))).toBeNull();
+    expect(parsePrivateLogin(new URL(`https://chrtv.example/lg/ken?${'p'.repeat(257)}.m3u`))).toBeNull();
+  });
+});
 
 describe('MAC normalization', () => {
   it('normalizes colon format', () => {
@@ -26,6 +67,34 @@ describe('MAC normalization', () => {
     expect(normalizeMac('zz:bb:cc:dd:ee:ff')).toBeNull();
     expect(normalizeMac('aa:bb:cc:dd:ee')).toBeNull();
     expect(normalizeMac(null)).toBeNull();
+  });
+});
+
+describe('configurable token identity binding', () => {
+  const req = new Request('https://chrtv.example.com/tv.m3u', {
+    headers: { 'CF-Connecting-IP': '203.0.113.8', 'X-Forwarded-For': '198.51.100.99' },
+  });
+
+  it('enables all claims by default and ignores spoofable forwarded IPs', () => {
+    expect(requestTokenBinding(req, { rawMac: 'aa-bb-cc-dd-ee-ff', userId: 7, accessKeyId: 9 })).toEqual({
+      ip: '203.0.113.8',
+      mac: 'AA:BB:CC:DD:EE:FF',
+      uid: 7,
+      aid: 9,
+    });
+  });
+
+  it('supports selected claims or an explicit none policy', () => {
+    expect(requestTokenBinding(req, { rawMac: 'aa:bb:cc:dd:ee:ff', userId: 7, accessKeyId: 9 }, 'mac,user')).toEqual({
+      mac: 'AA:BB:CC:DD:EE:FF',
+      uid: 7,
+    });
+    expect(requestTokenBinding(req, { rawMac: 'aa:bb:cc:dd:ee:ff', userId: 7 }, 'none')).toEqual({});
+    expect(requestTokenBinding(req, { userId: 7, sessionId: 11 }, 'none')).toEqual({ uid: 7, sid: 11 });
+  });
+
+  it('fails safe to the all-claims policy on configuration typos', () => {
+    expect(parseTokenBindingPolicy('ip,uesr')).toEqual({ ip: true, mac: true, user: true, key: true });
   });
 });
 
@@ -106,6 +175,17 @@ describe('stream tokens', () => {
     const token = await createToken(SECRET, { u: 'http://169.254.169.254/meta', iat: now, exp: now + 60 });
     const res = await verifyToken(SECRET, token);
     expect(res).toEqual({ ok: false, code: 'UNSAFE_URL' });
+  });
+  it('rejects session claims without a user owner', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await createToken(SECRET, {
+      u: 'https://cdn.example.com/a.m3u8',
+      iat: now,
+      exp: now + 60,
+      k: 'm',
+      sid: 11,
+    });
+    expect(await verifyToken(SECRET, token)).toEqual({ ok: false, code: 'TOKEN_INVALID' });
   });
 });
 
@@ -238,11 +318,13 @@ describe('HLS rewriting', () => {
     const uri = keyLine.match(/URI="([^"]+)"/)![1]!;
     expect(await verifyProxied(uri)).toBe('https://origin.example.com/live/abc/keys/k1.key');
   });
-  it('rewrites EXT-X-MAP, EXT-X-MEDIA, EXT-X-PART, EXT-X-PRELOAD-HINT, EXT-X-I-FRAME-STREAM-INF', async () => {
+  it('rewrites media, key, subtitle, rendition, image, and low-latency URI attributes', async () => {
     const manifest = [
       '#EXTM3U',
       '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",URI="audio/index.m3u8"',
       '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=100000,URI="iframe.m3u8"',
+      '#EXT-X-RENDITION-REPORT:URI="low/index.m3u8",LAST-MSN=12',
+      '#EXT-X-IMAGE-STREAM-INF:BANDWIDTH=1000,URI="images/index.m3u8"',
       '#EXT-X-MAP:URI="init.mp4"',
       '#EXT-X-PART:DURATION=1.0,URI="part1.m4s"',
       '#EXT-X-PRELOAD-HINT:TYPE=PART,URI="part2.m4s"',
@@ -261,12 +343,20 @@ describe('HLS rewriting', () => {
     expect(hint).toContain('/seg/');
     const iframe = out.split('\n').find((l) => l.startsWith('#EXT-X-I-FRAME-STREAM-INF'))!;
     expect(iframe).toContain('/hls/');
+    const rendition = out.split('\n').find((l) => l.startsWith('#EXT-X-RENDITION-REPORT'))!;
+    expect(rendition).toContain('/hls/');
+    const images = out.split('\n').find((l) => l.startsWith('#EXT-X-IMAGE-STREAM-INF'))!;
+    expect(images).toContain('/hls/');
   });
-  it('does not proxy unsafe URIs', async () => {
-    const manifest = '#EXTM3U\n#EXTINF:6.0,\nhttp://169.254.169.254/meta.ts\n#EXT-X-ENDLIST\n';
-    const out = await rewriteManifest(manifest, opts);
-    expect(out).not.toContain('/seg/');
-    expect(out).toContain('http://169.254.169.254/meta.ts'); // left as-is, never fetched by CHRTV
+  it('fails closed instead of leaking unsafe, malformed, or recursively untokenized descendant URIs', async () => {
+    const unsafe = '#EXTM3U\n#EXTINF:6.0,\nhttp://169.254.169.254/meta.ts\n#EXT-X-ENDLIST\n';
+    await expect(rewriteManifest(unsafe, opts)).rejects.toThrow('unsafe manifest URI');
+    const malformed = '#EXTM3U\n#EXTINF:6.0,\nhttp://[invalid\n#EXT-X-ENDLIST\n';
+    await expect(rewriteManifest(malformed, opts)).rejects.toThrow('invalid manifest URI');
+    const malformedAttr = '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=https://key.example.com/raw.key\n';
+    await expect(rewriteManifest(malformedAttr, opts)).rejects.toThrow('invalid manifest URI attribute');
+    const steering = '#EXTM3U\n#EXT-X-CONTENT-STEERING:SERVER-URI="https://steering.example.com/config.json"\n';
+    await expect(rewriteManifest(steering, opts)).rejects.toThrow('unsupported manifest URI attribute');
   });
   it('rejects non-HLS and oversized manifests', async () => {
     await expect(rewriteManifest('<html>err</html>', opts)).rejects.toThrow(HlsError);
@@ -330,9 +420,23 @@ describe('token stability (anti re-buffering)', () => {
     expect(segs[0]).not.toBe(segs[1]);
   });
 
-  it('drops URIs on ports Workers cannot fetch instead of proxying a dead URL', async () => {
-    const bad = '#EXTM3U\n#EXTINF:6.0,\nhttp://origin.example.com:30113/seg.ts\n#EXT-X-ENDLIST\n';
-    const out = await rewriteManifest(bad, opts);
-    expect(out).not.toContain('/seg/');
+  it('never issues descendant capabilities beyond the parent capability expiry', async () => {
+    const now = 1_800_000_000;
+    const absoluteExpiry = now + 30;
+    const source = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nchild.m3u8\n#EXTINF:6.0,\nseg.ts\n';
+    const out = await rewriteManifest(source, { ...opts, now, absoluteExpiry });
+    const urls = out.split('\n').filter((line) => line.startsWith('https://chrtv.example.com/'));
+    expect(urls).toHaveLength(2);
+    for (const url of urls) {
+      const token = url.match(/\/(?:hls|seg)\/([^.?]+)/)![1]!;
+      const verdict = await verifyToken(SECRET, token, now);
+      expect(verdict.ok).toBe(true);
+      if (verdict.ok) expect(verdict.payload.exp).toBe(absoluteExpiry);
+    }
+  });
+
+  it('rejects custom-port descendants before issuing unusable capabilities', async () => {
+    const custom = '#EXTM3U\n#EXTINF:6.0,\nhttp://origin.example.com:30113/seg.ts\n#EXT-X-ENDLIST\n';
+    await expect(rewriteManifest(custom, opts)).rejects.toThrow('unsupported manifest URI port');
   });
 });

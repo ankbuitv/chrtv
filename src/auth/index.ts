@@ -56,6 +56,21 @@ export async function authenticateAccessKey(
     return { ok: false, code: bad.code === ErrorCodes.AUTH_EXPIRED ? ErrorCodes.KEY_EXPIRED : bad.code, status: bad.status };
   }
 
+  // A key linked to a D1 user cannot outlive or bypass that user account.
+  if (key.user_id !== null) {
+    const owner = await env.DB.prepare('SELECT status, expires_at FROM users WHERE id = ?')
+      .bind(key.user_id)
+      .first<{ status: string; expires_at: number | null }>();
+    if (!owner) return { ok: false, code: ErrorCodes.AUTH_INVALID, status: 403 };
+    const ownerBad = checkStatusAndExpiry(owner.status, owner.expires_at);
+    if (ownerBad) return { ok: false, ...ownerBad };
+    // Return the effective authorization boundary so generated media tokens
+    // cannot outlive an earlier owner-account expiry.
+    if (owner.expires_at !== null && owner.expires_at > 0 && (key.expires_at === null || key.expires_at <= 0 || owner.expires_at < key.expires_at)) {
+      key.expires_at = owner.expires_at;
+    }
+  }
+
   const mac = normalizeMac(rawMac);
   if (mac) {
     const ts = now();
