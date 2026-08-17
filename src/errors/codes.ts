@@ -6,8 +6,13 @@ export const ErrorCodes = {
   KEY_INVALID: 'KEY_INVALID',
   KEY_EXPIRED: 'KEY_EXPIRED',
   DEVICE_LIMIT: 'DEVICE_LIMIT',
+  SESSION_LIMIT: 'SESSION_LIMIT',
+  /** Client IP is under a temporary honeypot/brute-force ban. */
+  SECURITY_BANNED: 'SECURITY_BANNED',
   TOKEN_INVALID: 'TOKEN_INVALID',
   TOKEN_EXPIRED: 'TOKEN_EXPIRED',
+  /** Token was minted for a different Cloudflare-observed client IP. */
+  TOKEN_BINDING_MISMATCH: 'TOKEN_BINDING_MISMATCH',
   UPSTREAM_TIMEOUT: 'UPSTREAM_TIMEOUT',
   UPSTREAM_404: 'UPSTREAM_404',
   UPSTREAM_4XX: 'UPSTREAM_4XX',

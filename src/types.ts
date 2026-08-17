@@ -7,13 +7,18 @@ export interface Env {
   EPG_URL: string;
   /** "true" => /tv.m3u works without an access key. */
   PUBLIC_PLAYLIST: string;
+  /** Comma-separated token claims: ip,mac,user,key. Defaults to all; "none" disables binding. */
+  TOKEN_BINDING?: string;
+  /** Set to "false" to disable scanner trap matching (existing bans still apply). */
+  HONEYPOT_ENABLED?: string;
+  /** Honeypot/brute-force ban duration in seconds (default: 86400, max: 604800). */
+  HONEYPOT_BAN_SECONDS?: string;
   /**
    * Optional fallback HLS playlist served when a channel upstream is dead.
-   * Comma-separated list allowed; candidates are tried in order.
-   * A candidate on a Workers-fetchable port is fetched + re-proxied (segments
-   * become /seg/{token}); one on a port Workers cannot open (e.g. :30113) is
-   * served to the player as a 302 redirect so it still plays.
-   * Empty => the empty "signal lost" error manifest is served.
+   * Comma-separated list allowed; candidates are tried in order. Only URLs on
+   * Workers-fetchable ports are re-proxied; unsupported-port candidates are
+   * skipped so their origins are never exposed in a client-facing redirect.
+   * Empty/no usable candidate => the empty "signal lost" manifest is served.
    */
   FALLBACK_M3U_URL?: string;
   /** Secret used for token encryption + credential hashing. Set via wrangler secret. */
@@ -61,6 +66,8 @@ export interface AccessKeyRow {
   key_prefix: string;
   label: string;
   username: string;
+  /** Optional D1 user that owns this key (added by migration 0005). */
+  user_id: number | null;
   status: string;
   max_devices: number;
   expires_at: number | null;

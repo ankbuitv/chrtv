@@ -39,7 +39,6 @@ export function landingPage(status: { syncStatus: string; channelCount: string; 
     <span class="pill"><span class="dot ${dotClass}"></span>${syncLabel}</span>
     <span class="pill">${status.channelCount || '0'} channels</span>
   </div>
-  <div class="foot">Playlist endpoint: <code>/tv.m3u</code></div>
 </main></body></html>`;
   return new Response(html, {
     status: 200,

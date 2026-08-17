@@ -1,12 +1,12 @@
 import type { Env, ChannelRow, UserRow } from '../types';
 import { authenticateUser, type AuthResult } from '../auth';
+import { recordAuthEvent, type AuthEventType } from '../auth/audit';
+import { clearLoginFailures, recordLoginFailure } from '../security/honeypot';
 import { listActiveChannels, listCategories, getChannelByXtreamId } from '../db/channels';
-import { createToken, DEFAULT_MANIFEST_TTL } from '../token';
+import { createToken, DEFAULT_MANIFEST_TTL, requestTokenBinding } from '../token';
 import { buildPlaylist, playlistResponse } from '../playlist/output';
 import { jsonResponse, errorResponse, logEvent } from '../utils/http';
 import { ErrorCodes } from '../errors/codes';
-import { handleHlsManifest } from '../proxy/handlers';
-import { isFetchablePort } from '../utils/ports';
 
 /**
  * Xtream Codes compatibility layer.
@@ -95,45 +95,41 @@ export async function readCredentials(req: Request): Promise<XtreamCredentials> 
 }
 
 /**
- * Xtream login.
- *
- * `PUBLIC_PLAYLIST=true` means "anyone may pull the playlist" — /tv.m3u already
- * works without credentials. Xtream clients (TiviMate, Smarters, OTT Navigator)
- * however ALWAYS send a username/password, and previously every one of them was
- * rejected with 401 unless an operator had manually created a D1 user, which is
- * exactly the "can't reach get.php" failure. In public mode we therefore accept
- * any credential as a guest session — including an empty one, since some
- * clients probe the portal before asking the user for credentials. Real D1
- * users still take precedence and a wrong password for an existing user is
- * still rejected.
+ * Xtream always requires a real D1 user. The intentionally public /tv.m3u is
+ * the sole no-credential playlist exception; public mode must not silently turn
+ * arbitrary Xtream usernames into guest accounts.
  */
-async function authenticateXtream(env: Env, username: string, password: string): Promise<AuthResult<UserRow>> {
-  const direct = await authenticateUser(env, username, password);
-  if (direct.ok) return direct;
-
-  const publicMode = (env.PUBLIC_PLAYLIST ?? 'true').toLowerCase() !== 'false';
-  if (!publicMode) return direct;
-  if (username.length > 128 || password.length > 256) return direct;
-
-  // Only fall back to guest access when this username is not a registered user.
-  if (username) {
-    const existing = await env.DB.prepare('SELECT 1 AS x FROM users WHERE username = ?').bind(username).first<{ x: number }>();
-    if (existing) return direct;
+async function authenticateXtreamRequest(
+  req: Request,
+  env: Env,
+  username: string,
+  password: string,
+  route: string,
+  eventType: AuthEventType = 'xtream',
+  auditSuccess = true,
+): Promise<AuthResult<UserRow>> {
+  const auth = await authenticateUser(env, username, password);
+  if (!auth.ok) {
+    const banned = await recordLoginFailure(req, env);
+    await recordAuthEvent(req, env, {
+      username,
+      eventType,
+      route,
+      outcome: banned ? 'blocked' : 'failure',
+    });
+    return auth;
   }
-
-  const ts = Math.floor(Date.now() / 1000);
-  const guest: UserRow = {
-    id: 0,
-    username: username || 'guest',
-    password_hash: '',
-    password_salt: '',
-    status: 'active',
-    max_connections: 4,
-    expires_at: null,
-    created_at: ts,
-    updated_at: ts,
-  };
-  return { ok: true, value: guest };
+  await clearLoginFailures(req, env);
+  if (auditSuccess) {
+    await recordAuthEvent(req, env, {
+      userId: auth.value.id,
+      username: auth.value.username,
+      eventType,
+      route,
+      outcome: 'success',
+    });
+  }
+  return auth;
 }
 
 function xtreamUserInfo(username: string, password: string, expiresAt: number | null, maxConnections: number) {
@@ -178,7 +174,7 @@ function serverInfo(origin: string) {
   };
 }
 
-function liveStreamEntry(ch: ChannelRow, i: number) {
+function liveStreamEntry(ch: ChannelRow, i: number, directSource = '') {
   return {
     num: i + 1,
     name: ch.name,
@@ -190,23 +186,54 @@ function liveStreamEntry(ch: ChannelRow, i: number) {
     category_id: String(ch.category_id ?? 0),
     custom_sid: '',
     tv_archive: 0,
-    direct_source: '',
+    direct_source: directSource,
     tv_archive_duration: 0,
   };
+}
+
+function boundedTokenExpiry(issued: number, accountExpiry: number | null): number {
+  const configured = issued + DEFAULT_MANIFEST_TTL;
+  return accountExpiry !== null && accountExpiry > 0 ? Math.min(configured, accountExpiry) : configured;
+}
+
+async function tokenizedLiveEntries(
+  channels: ChannelRow[],
+  env: Env,
+  req: Request,
+  origin: string,
+  userId: number,
+  accountExpiry: number | null,
+): Promise<ReturnType<typeof liveStreamEntry>[]> {
+  const issued = Math.floor(Date.now() / 1000);
+  const expires = boundedTokenExpiry(issued, accountExpiry);
+  const binding = requestTokenBinding(req, { userId }, env.TOKEN_BINDING);
+  return Promise.all(
+    channels.map(async (channel, index) => {
+      const token = await createToken(env.SECRET_KEY, {
+        u: channel.url,
+        iat: issued,
+        exp: expires,
+        k: 'm',
+        c: channel.id,
+        ...binding,
+      });
+      return liveStreamEntry(channel, index, `${origin}/hls/${token}.m3u8`);
+    }),
+  );
 }
 
 export async function handlePlayerApi(req: Request, env: Env, requestId: string): Promise<Response> {
   const url = new URL(req.url);
   const { username, password, params } = await readCredentials(req);
+  const action = params.get('action') ?? '';
 
-  const auth = await authenticateXtream(env, username, password);
+  const auth = await authenticateXtreamRequest(req, env, username, password, '/player_api.php', 'xtream', action === '');
   if (!auth.ok) {
     logEvent(requestId, '/player_api.php', auth.code);
     // Xtream clients expect a 200 + auth:0 body on bad credentials.
     return jsonResponse({ user_info: { auth: 0, status: 'Disabled' } }, 200);
   }
   const user = auth.value;
-  const action = params.get('action') ?? '';
   const origin = url.origin;
   const info = { ...xtreamUserInfo(username, password, user.expires_at, user.max_connections), ...serverInfo(origin) };
 
@@ -221,7 +248,7 @@ export async function handlePlayerApi(req: Request, env: Env, requestId: string)
       const channels = await listActiveChannels(env.DB);
       const catFilter = params.get('category_id');
       const filtered = catFilter ? channels.filter((c) => String(c.category_id ?? 0) === catFilter) : channels;
-      return jsonResponse(filtered.map(liveStreamEntry));
+      return jsonResponse(await tokenizedLiveEntries(filtered, env, req, origin, user.id, user.expires_at));
     }
     case 'get_vod_categories':
     case 'get_series_categories':
@@ -249,7 +276,7 @@ export async function handlePlayerApi(req: Request, env: Env, requestId: string)
 export async function handlePanelApi(req: Request, env: Env, requestId: string): Promise<Response> {
   const url = new URL(req.url);
   const { username, password } = await readCredentials(req);
-  const auth = await authenticateXtream(env, username, password);
+  const auth = await authenticateXtreamRequest(req, env, username, password, '/panel_api.php');
   if (!auth.ok) {
     logEvent(requestId, '/panel_api.php', auth.code);
     return jsonResponse({ user_info: { auth: 0, status: 'Disabled' } }, 200);
@@ -258,25 +285,34 @@ export async function handlePanelApi(req: Request, env: Env, requestId: string):
   const [channels, cats] = await Promise.all([listActiveChannels(env.DB), listCategories(env.DB)]);
   const categories: Record<string, string> = {};
   for (const c of cats) categories[String(c.id)] = c.name;
+  const entries = await tokenizedLiveEntries(channels, env, req, url.origin, user.id, user.expires_at);
 
   return jsonResponse({
     ...xtreamUserInfo(username, password, user.expires_at, user.max_connections),
     ...serverInfo(url.origin),
     categories: { live: categories, movie: {}, series: {} },
-    available_channels: Object.fromEntries(channels.map((ch, i) => [String(ch.xtream_id), liveStreamEntry(ch, i)])),
+    available_channels: Object.fromEntries(entries.map((entry) => [String(entry.stream_id), entry])),
   });
 }
 
 /** /get.php?username=..&password=..&type=m3u_plus — full M3U download. */
 export async function handleGetPhp(req: Request, env: Env, requestId: string): Promise<Response> {
   const url = new URL(req.url);
-  const { username, password } = await readCredentials(req);
-  const auth = await authenticateXtream(env, username, password);
+  const { username, password, params } = await readCredentials(req);
+  const auth = await authenticateXtreamRequest(req, env, username, password, '/get.php', 'playlist');
   if (!auth.ok) {
     logEvent(requestId, '/get.php', auth.code);
     return errorResponse(auth.code, auth.status, requestId);
   }
-  const body = await buildPlaylist(env, url.origin);
+  const binding = requestTokenBinding(
+    req,
+    {
+      rawMac: params.get('mac'),
+      userId: auth.value.id,
+    },
+    env.TOKEN_BINDING,
+  );
+  const body = await buildPlaylist(env, url.origin, binding, auth.value.expires_at);
   return playlistResponse(body, requestId, req.method === 'HEAD');
 }
 
@@ -297,7 +333,7 @@ export async function handleXtreamLive(
   } catch {
     /* keep raw values on malformed percent-encoding */
   }
-  const auth = await authenticateXtream(env, user, pass);
+  const auth = await authenticateXtreamRequest(req, env, user, pass, '/live');
   if (!auth.ok) {
     logEvent(requestId, '/live', auth.code);
     return errorResponse(auth.code, auth.status, requestId);
@@ -308,25 +344,59 @@ export async function handleXtreamLive(
   const channel = await getChannelByXtreamId(env.DB, xtreamId);
   if (!channel) return errorResponse(ErrorCodes.NOT_FOUND, 404, requestId);
 
-  if (!isFetchablePort(channel.url)) {
-    return new Response(null, {
-      status: 302,
-      headers: {
-        Location: channel.url,
-        'Access-Control-Allow-Origin': '*',
-        'X-Request-ID': requestId,
-      },
-    });
-  }
-
   const now = Math.floor(Date.now() / 1000);
+  const binding = requestTokenBinding(
+    req,
+    {
+      rawMac: new URL(req.url).searchParams.get('mac'),
+      userId: auth.value.id,
+    },
+    env.TOKEN_BINDING,
+  );
   const token = await createToken(env.SECRET_KEY, {
     u: channel.url,
     iat: now,
-    exp: now + DEFAULT_MANIFEST_TTL,
+    exp: boundedTokenExpiry(now, auth.value.expires_at),
     k: 'm',
     c: channel.id,
+    ...binding,
   });
-  // Serve the proxied manifest directly (no redirect hop for the player).
-  return handleHlsManifest(req, env, requestId, token);
+  // Legacy credential URLs remain accepted for Xtream compatibility, but they
+  // never serve media directly: the client is moved onto the opaque token URL.
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: `${new URL(req.url).origin}/hls/${token}.m3u8`,
+      'Cache-Control': 'private, no-store',
+      'Referrer-Policy': 'no-referrer',
+      'Access-Control-Allow-Origin': '*',
+      'X-Request-ID': requestId,
+    },
+  });
+}
+
+/** Legacy Xtream XMLTV credentials are exchanged for a dedicated EPG token. */
+export async function handleXtreamXmltv(req: Request, env: Env, requestId: string): Promise<Response> {
+  const { username, password, params } = await readCredentials(req);
+  const auth = await authenticateXtreamRequest(req, env, username, password, '/xmltv.php', 'xtream');
+  if (!auth.ok) return errorResponse(auth.code, auth.status, requestId);
+  const issued = Math.floor(Date.now() / 1000);
+  const binding = requestTokenBinding(req, { rawMac: params.get('mac'), userId: auth.value.id }, env.TOKEN_BINDING);
+  const token = await createToken(env.SECRET_KEY, {
+    u: 'https://epg-token.chrtv.invalid/xmltv.xml',
+    iat: issued,
+    exp: boundedTokenExpiry(issued, auth.value.expires_at),
+    k: 'e',
+    ...binding,
+  });
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: `${new URL(req.url).origin}/epg/${token}.xml`,
+      'Cache-Control': 'private, no-store',
+      'Referrer-Policy': 'no-referrer',
+      'Access-Control-Allow-Origin': '*',
+      'X-Request-ID': requestId,
+    },
+  });
 }

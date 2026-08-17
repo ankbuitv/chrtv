@@ -7,6 +7,7 @@ declare module 'cloudflare:test' {
     PLAYLIST_URL: string;
     EPG_URL: string;
     PUBLIC_PLAYLIST: string;
+    TOKEN_BINDING: string;
     FALLBACK_M3U_URL: string;
   }
 }

@@ -5,6 +5,7 @@ import { getSettings } from '../db/settings';
 import { hashPassword, hashAccessKey, randomHex } from '../utils/crypto';
 import { normalizeMac } from '../utils/mac';
 import { clearFailure } from '../proxy/failureCache';
+import { clearBanByHash } from '../security/honeypot';
 import { healthCheckBatch, listOfflineChannels, healthStats, DEFAULT_HEALTH_BATCH } from '../playlist/health';
 import { jsonResponse, errorResponse, methodNotAllowed, logEvent } from '../utils/http';
 import { ErrorCodes } from '../errors/codes';
@@ -53,17 +54,31 @@ export async function handleAdmin(req: Request, env: Env, requestId: string, sub
         'playlist_hash',
         'playlist_source',
       ]);
-      const [users, keys, devices, health] = await Promise.all([
+      const ts = now();
+      const [users, keys, devices, activeSessions, authEvents24h, activeBans, health] = await Promise.all([
         db.prepare('SELECT COUNT(*) AS n FROM users').first<{ n: number }>(),
         db.prepare('SELECT COUNT(*) AS n FROM access_keys').first<{ n: number }>(),
         db.prepare('SELECT COUNT(*) AS n FROM devices').first<{ n: number }>(),
+        db
+          .prepare("SELECT COUNT(*) AS n FROM user_sessions WHERE status = 'active' AND (expires_at IS NULL OR expires_at > ?)")
+          .bind(ts)
+          .first<{ n: number }>(),
+        db.prepare('SELECT COUNT(*) AS n FROM auth_events WHERE created_at > ?').bind(ts - 86400).first<{ n: number }>(),
+        db.prepare('SELECT COUNT(*) AS n FROM security_bans WHERE expires_at > ?').bind(ts).first<{ n: number }>(),
         healthStats(db),
       ]);
       return jsonResponse({
         service: 'CHRTV',
         playlist: settings,
         health,
-        stats: { users: users?.n ?? 0, access_keys: keys?.n ?? 0, devices: devices?.n ?? 0 },
+        stats: {
+          users: users?.n ?? 0,
+          access_keys: keys?.n ?? 0,
+          devices: devices?.n ?? 0,
+          active_sessions: activeSessions?.n ?? 0,
+          auth_events_24h: authEvents24h?.n ?? 0,
+          active_security_bans: activeBans?.n ?? 0,
+        },
       });
     }
 
@@ -116,6 +131,60 @@ export async function handleAdmin(req: Request, env: Env, requestId: string, sub
       return jsonResponse({ ok: true });
     }
 
+    // ---- temporary security bans (IP addresses are never stored or returned) ----
+    if (subPath === 'security-bans' && method === 'GET') {
+      const ts = now();
+      await db.prepare('DELETE FROM security_bans WHERE expires_at <= ?').bind(ts).run();
+      const { results } = await db
+        .prepare(
+          `SELECT ip_hash, reason, first_seen, last_seen, expires_at, hit_count
+             FROM security_bans
+            WHERE expires_at > ?
+            ORDER BY last_seen DESC
+            LIMIT 500`,
+        )
+        .bind(ts)
+        .all();
+      return jsonResponse(results);
+    }
+    const banMatch = subPath.match(/^security-bans\/([a-f0-9]{64})$/);
+    if (banMatch) {
+      if (method !== 'DELETE') return methodNotAllowed(['DELETE'], requestId);
+      await clearBanByHash(db, banMatch[1]!);
+      return jsonResponse({ ok: true });
+    }
+
+    // ---- authentication history + revocable user sessions ----
+    if (subPath === 'auth-events' && method === 'GET') {
+      const requested = Number(new URL(req.url).searchParams.get('limit'));
+      const limit = Number.isSafeInteger(requested) && requested > 0 ? Math.min(requested, 1000) : 300;
+      const { results } = await db
+        .prepare(
+          `SELECT id, user_id, session_id, username, event_type, route, outcome, ip_address, user_agent, created_at
+             FROM auth_events ORDER BY id DESC LIMIT ?`,
+        )
+        .bind(limit)
+        .all();
+      return jsonResponse(results);
+    }
+    if (subPath === 'sessions' && method === 'GET') {
+      const { results } = await db
+        .prepare(
+          `SELECT s.id, s.user_id, u.username, s.token_prefix, s.device_name, s.user_agent,
+                  s.ip_address, s.last_ip, s.status, s.created_at, s.last_seen, s.expires_at
+             FROM user_sessions s JOIN users u ON u.id = s.user_id
+            ORDER BY s.last_seen DESC LIMIT 1000`,
+        )
+        .all();
+      return jsonResponse(results);
+    }
+    const sessionMatch = subPath.match(/^sessions\/(\d+)$/);
+    if (sessionMatch) {
+      if (method !== 'DELETE') return methodNotAllowed(['DELETE'], requestId);
+      await db.prepare("UPDATE user_sessions SET status = 'revoked' WHERE id = ?").bind(Number(sessionMatch[1])).run();
+      return jsonResponse({ ok: true });
+    }
+
     // ---- channel health (proactive offline detection) ----
     if (subPath === 'offline' && method === 'GET') {
       const offline = await listOfflineChannels(db, 1000);
@@ -148,7 +217,14 @@ export async function handleAdmin(req: Request, env: Env, requestId: string, sub
         const body = await readJson(req);
         const username = str(body?.['username'], 128).trim();
         const password = str(body?.['password'], 256);
-        if (!/^[A-Za-z0-9_.-]{3,64}$/.test(username) || password.length < 8) {
+        const maxConnections = body?.['max_connections'] === undefined ? 1 : Number(body['max_connections']);
+        if (
+          !/^[A-Za-z0-9_.-]{3,64}$/.test(username) ||
+          password.length < 8 ||
+          !Number.isSafeInteger(maxConnections) ||
+          maxConnections < 1 ||
+          maxConnections > 100
+        ) {
           return errorResponse(ErrorCodes.BAD_REQUEST, 400, requestId);
         }
         const salt = randomHex(16);
@@ -161,7 +237,7 @@ export async function handleAdmin(req: Request, env: Env, requestId: string, sub
               `INSERT INTO users (username, password_hash, password_salt, status, max_connections, expires_at, created_at, updated_at)
                VALUES (?, ?, ?, 'active', ?, ?, ?, ?)`,
             )
-            .bind(username, hash, salt, Number(body?.['max_connections']) || 1, expiresAt, ts, ts)
+            .bind(username, hash, salt, maxConnections, expiresAt, ts, ts)
             .run();
         } catch {
           return errorResponse(ErrorCodes.BAD_REQUEST, 409, requestId);
@@ -177,17 +253,34 @@ export async function handleAdmin(req: Request, env: Env, requestId: string, sub
         const body = await readJson(req);
         const status = str(body?.['status'], 16);
         if (status && !VALID_STATUSES.has(status)) return errorResponse(ErrorCodes.BAD_REQUEST, 400, requestId);
-        if (status) await db.prepare('UPDATE users SET status = ?, updated_at = ? WHERE id = ?').bind(status, now(), id).run();
+        const hasMaxConnections = body?.['max_connections'] !== undefined;
+        const maxConnections = Number(body?.['max_connections']);
+        if (hasMaxConnections && (!Number.isSafeInteger(maxConnections) || maxConnections < 1 || maxConnections > 100)) {
+          return errorResponse(ErrorCodes.BAD_REQUEST, 400, requestId);
+        }
+        if (status) {
+          await db.prepare('UPDATE users SET status = ?, updated_at = ? WHERE id = ?').bind(status, now(), id).run();
+          if (status !== 'active') {
+            await db.prepare("UPDATE user_sessions SET status = 'revoked' WHERE user_id = ? AND status = 'active'").bind(id).run();
+          }
+        }
         if (typeof body?.['expires_at'] === 'number' || body?.['expires_at'] === null) {
-          await db
-            .prepare('UPDATE users SET expires_at = ?, updated_at = ? WHERE id = ?')
-            .bind(body['expires_at'] as number | null, now(), id)
-            .run();
+          const expiresAt = body['expires_at'] as number | null;
+          await db.batch([
+            db.prepare('UPDATE users SET expires_at = ?, updated_at = ? WHERE id = ?').bind(expiresAt, now(), id),
+            db.prepare("UPDATE user_sessions SET expires_at = ? WHERE user_id = ? AND status = 'active'").bind(expiresAt, id),
+          ]);
+        }
+        if (hasMaxConnections) {
+          await db.prepare('UPDATE users SET max_connections = ?, updated_at = ? WHERE id = ?').bind(maxConnections, now(), id).run();
         }
         return jsonResponse({ ok: true });
       }
       if (method === 'DELETE') {
-        await db.prepare("UPDATE users SET status = 'revoked', updated_at = ? WHERE id = ?").bind(now(), id).run();
+        await db.batch([
+          db.prepare("UPDATE users SET status = 'revoked', updated_at = ? WHERE id = ?").bind(now(), id),
+          db.prepare("UPDATE user_sessions SET status = 'revoked' WHERE user_id = ? AND status = 'active'").bind(id),
+        ]);
         return jsonResponse({ ok: true });
       }
       return methodNotAllowed(['PATCH', 'DELETE'], requestId);
@@ -198,27 +291,47 @@ export async function handleAdmin(req: Request, env: Env, requestId: string, sub
       if (method === 'GET') {
         const { results } = await db
           .prepare(
-            'SELECT id, key_prefix, label, username, status, max_devices, expires_at, created_at FROM access_keys ORDER BY id',
+            'SELECT id, key_prefix, label, username, user_id, status, max_devices, expires_at, created_at FROM access_keys ORDER BY id',
           )
           .all();
         return jsonResponse(results); // key hashes intentionally excluded
       }
       if (method === 'POST') {
         const body = await readJson(req);
+        const requestedUserId = body?.['user_id'];
+        let userId: number | null = null;
+        let ownerUsername = str(body?.['username'], 128);
+        if (requestedUserId !== undefined && requestedUserId !== null) {
+          const parsedUserId = Number(requestedUserId);
+          if (!Number.isSafeInteger(parsedUserId) || parsedUserId <= 0) {
+            return errorResponse(ErrorCodes.BAD_REQUEST, 400, requestId);
+          }
+          const owner = await db.prepare('SELECT id, username FROM users WHERE id = ?').bind(parsedUserId).first<{
+            id: number;
+            username: string;
+          }>();
+          if (!owner) return errorResponse(ErrorCodes.BAD_REQUEST, 400, requestId);
+          userId = owner.id;
+          // Keep the legacy display column synchronized with the actual owner;
+          // callers cannot spoof a different username next to a linked user id.
+          ownerUsername = owner.username;
+        }
+
         const rawKey = `chr_${randomHex(24)}`;
         const keyHash = await hashAccessKey(env.SECRET_KEY, rawKey);
         const expiresAt = typeof body?.['expires_at'] === 'number' ? (body['expires_at'] as number) : null;
         const ts = now();
         await db
           .prepare(
-            `INSERT INTO access_keys (key_hash, key_prefix, label, username, status, max_devices, expires_at, created_at, updated_at)
-             VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
+            `INSERT INTO access_keys (key_hash, key_prefix, label, username, user_id, status, max_devices, expires_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
           )
           .bind(
             keyHash,
             rawKey.slice(0, 12),
             str(body?.['label']),
-            str(body?.['username'], 128),
+            ownerUsername,
+            userId,
             Number(body?.['max_devices']) || 3,
             expiresAt,
             ts,
@@ -226,7 +339,7 @@ export async function handleAdmin(req: Request, env: Env, requestId: string, sub
           )
           .run();
         // The raw key is returned exactly once, at creation.
-        return jsonResponse({ ok: true, access_key: rawKey }, 201);
+        return jsonResponse({ ok: true, access_key: rawKey, user_id: userId }, 201);
       }
       return methodNotAllowed(['GET', 'POST'], requestId);
     }
@@ -235,9 +348,45 @@ export async function handleAdmin(req: Request, env: Env, requestId: string, sub
       const id = Number(keyMatch[1]);
       if (method === 'PATCH') {
         const body = await readJson(req);
-        const status = str(body?.['status'], 16);
-        if (!VALID_STATUSES.has(status)) return errorResponse(ErrorCodes.BAD_REQUEST, 400, requestId);
-        await db.prepare('UPDATE access_keys SET status = ?, updated_at = ? WHERE id = ?').bind(status, now(), id).run();
+        if (!body) return errorResponse(ErrorCodes.BAD_REQUEST, 400, requestId);
+        const status = str(body['status'], 16);
+        const hasStatus = body['status'] !== undefined;
+        const hasUserId = body['user_id'] !== undefined;
+        if (!hasStatus && !hasUserId) return errorResponse(ErrorCodes.BAD_REQUEST, 400, requestId);
+        if (hasStatus && !VALID_STATUSES.has(status)) return errorResponse(ErrorCodes.BAD_REQUEST, 400, requestId);
+
+        // Validate every supplied field before writing either one, so a bad
+        // user_id cannot leave a valid status update partially applied.
+        let userId: number | null = null;
+        let username = '';
+        if (hasUserId && body['user_id'] !== null) {
+          const parsedUserId = Number(body['user_id']);
+          if (!Number.isSafeInteger(parsedUserId) || parsedUserId <= 0) {
+            return errorResponse(ErrorCodes.BAD_REQUEST, 400, requestId);
+          }
+          const owner = await db.prepare('SELECT id, username FROM users WHERE id = ?').bind(parsedUserId).first<{
+            id: number;
+            username: string;
+          }>();
+          if (!owner) return errorResponse(ErrorCodes.BAD_REQUEST, 400, requestId);
+          userId = owner.id;
+          username = owner.username;
+        }
+
+        const ts = now();
+        if (hasStatus && hasUserId) {
+          await db
+            .prepare('UPDATE access_keys SET status = ?, user_id = ?, username = ?, updated_at = ? WHERE id = ?')
+            .bind(status, userId, username, ts, id)
+            .run();
+        } else if (hasStatus) {
+          await db.prepare('UPDATE access_keys SET status = ?, updated_at = ? WHERE id = ?').bind(status, ts, id).run();
+        } else {
+          await db
+            .prepare('UPDATE access_keys SET user_id = ?, username = ?, updated_at = ? WHERE id = ?')
+            .bind(userId, username, ts, id)
+            .run();
+        }
         return jsonResponse({ ok: true });
       }
       if (method === 'DELETE') {
