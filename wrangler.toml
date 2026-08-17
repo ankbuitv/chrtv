@@ -29,7 +29,16 @@ PUBLIC_PLAYLIST = "true"
 # Claims embedded in stream tokens. Choose any comma-separated subset of
 # ip,mac,user,key; use "none" only when identity binding is intentionally off.
 # Invalid values fall back to this secure all-claims default.
-TOKEN_BINDING = "ip,mac,user,key"
+#
+# NOTE: `ip` was removed from the default because it locks every /hls/ token
+# to the exact Cloudflare-observed IP that fetched the playlist. That breaks
+# playback whenever the viewing IP differs from the login/playlist IP — e.g.
+# logging in on a PC then playing on a TV box, or ISPs that rotate the public
+# IP (CGNAT), which is very common in Vietnam. Tokens are still bound to the
+# D1 user/session (uid/sid) and access key, so revoking a user/session still
+# kills their streams. Re-add `ip` if you want the strictest anti-sharing
+# posture and always fetch+play from the same network.
+TOKEN_BINDING = "mac,user,key"
 # Conservative scanner honeypots (/.env, /.git/*, wp-login.php, etc.). A direct
 # hit stores only an HMAC of CF-Connecting-IP in the ban tables for one day.
 # Browser-declared cross-site requests still get fake 404 but do not create a ban.

@@ -65,9 +65,10 @@ async function serveFallbackManifest(
   binding: TokenBinding = {},
   channelId?: string,
   absoluteExpiry?: number,
+  reason?: string,
 ): Promise<Response> {
   const candidates = fallbackCandidates(env);
-  if (candidates.length === 0) return errorManifestResponse(requestId);
+  if (candidates.length === 0) return errorManifestResponse(requestId, reason);
 
   for (const fallbackUrl of candidates) {
     if (!isFetchablePort(fallbackUrl)) {
@@ -119,7 +120,7 @@ async function serveFallbackManifest(
     });
   }
 
-  return errorManifestResponse(requestId);
+  return errorManifestResponse(requestId, reason);
 }
 
 export async function handleHlsManifest(req: Request, env: Env, requestId: string, rawToken: string): Promise<Response> {
@@ -157,7 +158,7 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
   if (!isFetchablePort(payload.u)) {
     logEvent(requestId, '/hls', ErrorCodes.UNSUPPORTED_PORT, 'origin hidden');
     if (payload.c) await recordFailure(env.DB, payload.c, ErrorCodes.UNSUPPORTED_PORT, 0);
-    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp);
+    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp, ErrorCodes.UNSUPPORTED_PORT);
   }
 
   const fkey = await failureKey(payload);
@@ -166,7 +167,7 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
   const failed = await getFailure(fkey);
   if (failed) {
     logEvent(requestId, '/hls', 'CIRCUIT_OPEN', failed.code);
-    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp);
+    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp, failed.code);
   }
 
   const upstream = await fetchUpstream(payload.u, req, 'GET', 'manifest');
@@ -174,7 +175,7 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
     logEvent(requestId, '/hls', upstream.code, `status=${upstream.status}`);
     await setFailure(fkey, { code: upstream.code, status: upstream.status, at: Date.now() });
     if (payload.c) await recordFailure(env.DB, payload.c, upstream.code, upstream.status);
-    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp);
+    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp, upstream.code);
   }
 
   let text: string;
@@ -182,14 +183,14 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
     text = await upstream.response.text();
   } catch {
     await setFailure(fkey, { code: ErrorCodes.UPSTREAM_UNREACHABLE, status: 0, at: Date.now() });
-    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp);
+    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp, ErrorCodes.UPSTREAM_UNREACHABLE);
   }
 
   if (!looksLikeHls(text) || text.trim().length === 0) {
     logEvent(requestId, '/hls', ErrorCodes.INVALID_HLS);
     await setFailure(fkey, { code: ErrorCodes.INVALID_HLS, status: upstream.response.status, at: Date.now() });
     if (payload.c) await recordFailure(env.DB, payload.c, ErrorCodes.INVALID_HLS, upstream.response.status);
-    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp);
+    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp, ErrorCodes.INVALID_HLS);
   }
 
   let rewritten: string;
@@ -204,7 +205,7 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
     });
   } catch (err) {
     logEvent(requestId, '/hls', ErrorCodes.INVALID_HLS, err instanceof HlsError ? err.message : 'rewrite failed');
-    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp);
+    return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp, ErrorCodes.INVALID_HLS);
   }
 
   return new Response(req.method === 'HEAD' ? null : rewritten, {
