@@ -18,12 +18,6 @@ export default defineWorkersConfig(async () => {
               PLAYLIST_URL: 'https://raw.example.com/playlists/tv.m3u',
               EPG_URL: '',
               PUBLIC_PLAYLIST: 'true',
-              // Tests pin the strict binding policy explicitly: several
-              // specs assert IP/MAC/user/key claims inside tokens, so they
-              // must not silently inherit the (operator-tunable) value from
-              // wrangler.toml. The single relaxed-binding test sets
-              // TOKEN_BINDING itself.
-              TOKEN_BINDING: 'ip,mac,user,key',
               // Tests that exercise fallback behaviour pass FALLBACK_M3U_URL
               // explicitly; the default stays empty so the built-in "signal
               // lost" manifest is the baseline (wrangler.toml's real value

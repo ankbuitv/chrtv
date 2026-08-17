@@ -7,7 +7,7 @@ import { ErrorCodes, type ErrorCode } from '../errors/codes';
  * Slow relays (e.g. devda.undo.it bouncing to the real CDN) routinely take
  * 10-25s to first byte — slow to tune in, but perfectly watchable. Cutting
  * them off at 6-8s tripped the circuit breaker on healthy channels, which is
- * exactly how "a healthy channel ends up flagged offline" happens.
+ * exactly how "kênh hệ thống xem bình thường mà bị báo offline" happens.
  * Kept as two constants so operators can still tune manifest vs segment
  * separately, but both default to the same 30s ceiling. (Player-side fetch
  * waits don't count against Workers CPU time, only wall clock.)
@@ -15,9 +15,9 @@ import { ErrorCodes, type ErrorCode } from '../errors/codes';
  * IMPORTANT: this is a TOTAL wall-clock budget for the whole request —
  * shared across every redirect hop AND the transient-failure retry. The old
  * code armed a fresh 30s timer per hop, so a slow 6-hop redirect chain could
- * keep a player staring at a spinner for up to ~3 minutes ("video loads way
- * too long") before the fallback ever appeared. Now the player waits at most
- * ~30s worst case, same as the declared policy.
+ * keep a player staring at a spinner for up to ~3 minutes ("load video quá
+ * lâu") before the fallback ever appeared. Now the player waits at most ~30s
+ * worst case, same as the declared policy.
  */
 const MANIFEST_TIMEOUT_MS = 30_000;
 const SEGMENT_TIMEOUT_MS = 30_000;
@@ -74,7 +74,7 @@ async function cancelBody(res: Response): Promise<void> {
  * Transient failures worth one immediate retry — fast-failing kinds only
  * (connection refused / 5xx come back instantly, so a retry costs nothing).
  * A 30s timeout is NOT a hiccup, it is already a conclusive verdict; retrying
- * it would just stretch "30s until offline" into 60s before the player ever
+ * it would just stretch "quá 30s mới offline" into 60s before the player ever
  * sees the fallback.
  */
 function isRetryable(code: ErrorCode): boolean {

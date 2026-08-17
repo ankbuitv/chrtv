@@ -36,7 +36,7 @@ import { logEvent } from '../utils/http';
  *    runs. Cron triggers fire on an arbitrary Cloudflare colo, possibly
  *    outside the audience's country, so a 403 seen by the sweep proves nothing
  *    about what viewers see. Flagging those offline is how a healthy playlist
- *    ends up "fully offline".
+ *    ends up "toàn offline".
  * A single unreachable probe can still be a network blip at the probing colo,
  * so the sweep keeps a per-channel `fail_streak`: the first unreachable result
  * records `unknown` (streak 1), and only a second consecutive one flips the
@@ -248,7 +248,7 @@ export async function probeChannel(url: string): Promise<ProbeResult> {
     const prefix = await readPrefix(res, PROBE_PREFIX_BYTES);
     // 200 + non-HLS body: reachable but serving something odd — frequently an
     // anti-bot/interstitial page that only the datacenter probe sees while
-    // real players stream fine. Suspicious, but NOT "link unreachable".
+    // real players stream fine. Suspicious, but NOT "link không vô được".
     return looksLikeHls(prefix)
       ? { status: 'online', errorCode: '', httpStatus: res.status }
       : { status: 'unknown', errorCode: ErrorCodes.INVALID_HLS, httpStatus: res.status };
