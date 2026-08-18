@@ -210,7 +210,12 @@ async function tokenUrl(opts: RewriteOptions, upstream: string, kind: 'm' | 's')
   }
 }
 
-async function rewriteAttrUri(line: string, opts: RewriteOptions, kind: 'm' | 's'): Promise<string> {
+async function rewriteAttrUri(
+  line: string,
+  opts: RewriteOptions,
+  kind: 'm' | 's',
+  promoteManifestByExtension = false,
+): Promise<string> {
   // Match the exact URI attribute, not SERVER-URI or another attribute whose
   // name merely ends in "URI". HLS URI attribute values are quoted strings.
   const m = line.match(/(^|[:,])(\s*)URI="([^"]*)"/);
@@ -222,7 +227,14 @@ async function rewriteAttrUri(line: string, opts: RewriteOptions, kind: 'm' | 's
   if (!uri) throw new HlsError('empty manifest URI');
   const abs = resolveUri(uri, opts.baseUrl);
   if (!abs) throw new HlsError('invalid manifest URI');
-  const proxied = await tokenUrl(opts, abs, kind === 'm' || isManifestUrl(abs) ? 'm' : 's');
+  // HLS tag semantics beat filename extensions. Some relays serve keys, maps,
+  // parts, and even MPEG-TS segments through an `index.m3u8?u=…` endpoint. If
+  // those known media resources are promoted to manifest tokens solely because
+  // the endpoint ends in .m3u8, /hls will parse binary media as text and return
+  // the empty fallback forever. The extension heuristic remains only for an
+  // unknown/future URI-bearing tag where no stronger semantic signal exists.
+  const tokenKind = kind === 'm' || (promoteManifestByExtension && isManifestUrl(abs)) ? 'm' : 's';
+  const proxied = await tokenUrl(opts, abs, tokenKind);
   return line.replace(m[0], `${m[1]}${m[2]}URI="${proxied}"`);
 }
 
@@ -266,7 +278,7 @@ export async function rewriteManifest(text: string, opts: RewriteOptions): Promi
       // uses SERVER-URI and returns another document containing URLs; reject it
       // until CHRTV can recursively rewrite that document as well.
       if (/(^|[:,])\s*URI=/i.test(line)) {
-        out.push(await rewriteAttrUri(line, opts, 's'));
+        out.push(await rewriteAttrUri(line, opts, 's', true));
         continue;
       }
       if (/\bSERVER-URI=/i.test(line)) throw new HlsError('unsupported manifest URI attribute');
@@ -277,10 +289,14 @@ export async function rewriteManifest(text: string, opts: RewriteOptions): Promi
       out.push(line);
       continue;
     }
-    // URI line (segment or child playlist)
+    // URI line (segment or child playlist). HLS context is authoritative:
+    // a variant URI follows EXT-X-STREAM-INF; every other URI line is media.
+    // Do not infer from `.m3u8` here — playnow-style relays deliberately use an
+    // index.m3u8 endpoint for binary segment requests distinguished by `?u=`.
+    // Wrapper playlists have already been converted to STREAM-INF masters.
     const abs = resolveUri(line.trim(), opts.baseUrl);
     if (!abs) throw new HlsError('invalid manifest URI');
-    const kind: 'm' | 's' = nextIsChildManifest || isManifestUrl(abs) ? 'm' : 's';
+    const kind: 'm' | 's' = nextIsChildManifest ? 'm' : 's';
     nextIsChildManifest = false;
     const proxied = await tokenUrl(opts, abs, kind);
     out.push(proxied);

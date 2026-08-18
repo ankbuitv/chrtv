@@ -1,4 +1,5 @@
 import { sha256Hex } from '../utils/crypto';
+import { isFetchablePort } from '../utils/ports';
 import { isSafeUpstreamUrl } from '../utils/urlsafe';
 import { applyDirective, emptyPlayOpts, type PlayOpts } from './playOpts';
 
@@ -72,7 +73,7 @@ export async function parsePlaylist(text: string): Promise<ParseResult> {
     if (!pending) continue; // URL without EXTINF
     const { name, attrs, opts } = pending;
     pending = null;
-    if (!name || !isSafeUpstreamUrl(line)) {
+    if (!name || !isSafeUpstreamUrl(line) || !isFetchablePort(line)) {
       skipped++;
       continue;
     }
