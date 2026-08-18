@@ -5,6 +5,7 @@ import { clearLoginFailures, recordLoginFailure } from '../security/honeypot';
 import { listActiveChannels, listCategories, getChannelByXtreamId } from '../db/channels';
 import { createToken, DEFAULT_MANIFEST_TTL, requestTokenBinding } from '../token';
 import { buildPlaylist, playlistResponse } from '../playlist/output';
+import { parsePlayOpts, resolvedKind, tokenHintsFromPlayOpts } from '../playlist/playOpts';
 import { jsonResponse, errorResponse, logEvent } from '../utils/http';
 import { ErrorCodes } from '../errors/codes';
 
@@ -209,6 +210,8 @@ async function tokenizedLiveEntries(
   const binding = requestTokenBinding(req, { userId }, env.TOKEN_BINDING);
   return Promise.all(
     channels.map(async (channel, index) => {
+      const hints = tokenHintsFromPlayOpts(channel.play_opts, channel.url);
+      const kind = resolvedKind(parsePlayOpts(channel.play_opts), channel.url);
       const token = await createToken(env.SECRET_KEY, {
         u: channel.url,
         iat: issued,
@@ -216,8 +219,10 @@ async function tokenizedLiveEntries(
         k: 'm',
         c: channel.id,
         ...binding,
+        ...hints,
       });
-      return liveStreamEntry(channel, index, `${origin}/hls/${token}.m3u8`);
+      const src = kind === 'mpd' ? `${origin}/mpd/${token}.mpd` : `${origin}/hls/${token}.m3u8`;
+      return liveStreamEntry(channel, index, src);
     }),
   );
 }
@@ -353,6 +358,8 @@ export async function handleXtreamLive(
     },
     env.TOKEN_BINDING,
   );
+  const hints = tokenHintsFromPlayOpts(channel.play_opts, channel.url);
+  const kind = resolvedKind(parsePlayOpts(channel.play_opts), channel.url);
   const token = await createToken(env.SECRET_KEY, {
     u: channel.url,
     iat: now,
@@ -360,13 +367,15 @@ export async function handleXtreamLive(
     k: 'm',
     c: channel.id,
     ...binding,
+    ...hints,
   });
+  const dest = kind === 'mpd' ? `/mpd/${token}.mpd` : `/hls/${token}.m3u8`;
   // Legacy credential URLs remain accepted for Xtream compatibility, but they
   // never serve media directly: the client is moved onto the opaque token URL.
   return new Response(null, {
     status: 302,
     headers: {
-      Location: `${new URL(req.url).origin}/hls/${token}.m3u8`,
+      Location: `${new URL(req.url).origin}${dest}`,
       'Cache-Control': 'private, no-store',
       'Referrer-Policy': 'no-referrer',
       'Access-Control-Allow-Origin': '*',

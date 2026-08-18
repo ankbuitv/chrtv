@@ -1,24 +1,21 @@
-import {
-  createToken,
-  SEGMENT_TTL,
-  DEFAULT_MANIFEST_TTL,
-  TOKEN_STABILITY_WINDOW,
-  tokenBindingSeed,
-  type TokenBinding,
-  type TokenPayload,
-} from '../token';
-import { isSafeUpstreamUrl } from '../utils/urlsafe';
-import { isFetchablePort } from '../utils/ports';
+import { type TokenBinding } from '../token';
+import { mintProxyUrl, MintError, type MintOptions } from '../proxy/mint';
 
 /**
  * HLS manifest rewriter.
  * Every URI (line URIs and attribute URI="..." in tags) is resolved against the
  * FINAL upstream URL (post-redirect) and replaced by a CHRTV token URL:
- *   child manifests -> /hls/{token}.m3u8
+ *   child manifests -> /hls/{token}.m3u8  (or /mpd/ when the URI is DASH)
  *   media/keys/maps -> /seg/{token}[.ext]
  * Any resolved URL that cannot be safely proxied rejects the manifest rather
  * than leaking a direct URI. URLs on ports Cloudflare Workers cannot fetch are
  * rejected too: redirecting the player would expose the raw origin.
+ *
+ * PHP / relay "proxies" often return a tiny M3U that just points at another
+ * .m3u8 (sometimes without a .m3u8 extension — `index.php?id=…&ext=.m3u8`).
+ * Those wrappers are detected here so the handler can follow them, and so a
+ * leftover wrapper is rewritten as a real master playlist instead of as a
+ * media segment (which hls.js then tries to demux as MPEG-TS and fails).
  */
 
 const MAX_MANIFEST_BYTES = 2 * 1024 * 1024;
@@ -33,13 +30,27 @@ const MANIFEST_URI_TAGS = [
 // Tags whose URI attribute points to *media* (segments, keys, init sections, parts).
 const MEDIA_URI_TAGS = ['#EXT-X-KEY', '#EXT-X-SESSION-KEY', '#EXT-X-MAP', '#EXT-X-PART', '#EXT-X-PRELOAD-HINT'];
 
+const MEDIA_EXTS = new Set(['ts', 'm4s', 'm4v', 'mp4', 'aac', 'ac3', 'vtt', 'srt', 'key', 'jpg', 'jpeg', 'png', 'webp']);
+
 export class HlsError extends Error {}
 
 export function looksLikeHls(text: string): boolean {
   return text.trimStart().startsWith('#EXTM3U');
 }
 
-function resolveUri(uri: string, baseUrl: string): string | null {
+export function extOf(url: string): string {
+  try {
+    const path = new URL(url).pathname;
+    const dot = path.lastIndexOf('.');
+    if (dot === -1) return '';
+    const ext = path.slice(dot + 1).toLowerCase();
+    return /^[a-z0-9]{1,5}$/.test(ext) ? ext : '';
+  } catch {
+    return '';
+  }
+}
+
+export function resolveUri(uri: string, baseUrl: string): string | null {
   try {
     const base = new URL(baseUrl);
     const resolved = new URL(uri, baseUrl);
@@ -61,21 +72,101 @@ function resolveUri(uri: string, baseUrl: string): string | null {
   }
 }
 
-function extOf(url: string): string {
+/** True when the URL itself is (or is advertised as) a playlist, not media. */
+export function looksLikePlaylistUrl(url: string): boolean {
+  const e = extOf(url);
+  if (e === 'm3u8' || e === 'm3u' || e === 'mpd') return true;
   try {
-    const path = new URL(url).pathname;
-    const dot = path.lastIndexOf('.');
-    if (dot === -1) return '';
-    const ext = path.slice(dot + 1).toLowerCase();
-    return /^[a-z0-9]{1,5}$/.test(ext) ? ext : '';
+    const u = new URL(url);
+    const q = u.search.toLowerCase();
+    if (q.includes('.m3u8') || q.includes('.m3u') || q.includes('.mpd')) return true;
+    if (/(?:^|[?&])(?:ext|type|format|output)=(?:\.?)?(m3u8?|mpd|hls|dash)\b/i.test(u.search)) return true;
   } catch {
-    return '';
+    /* ignore */
   }
+  return false;
+}
+
+export function isObviousMediaUrl(url: string): boolean {
+  return MEDIA_EXTS.has(extOf(url));
 }
 
 function isManifestUrl(url: string): boolean {
-  const e = extOf(url);
-  return e === 'm3u8' || e === 'm3u';
+  return looksLikePlaylistUrl(url);
+}
+
+/** Non-comment URI lines (segments / child playlists), resolved against baseUrl. */
+export function listUriLines(text: string, baseUrl: string): string[] {
+  const out: string[] = [];
+  for (const raw of text.replace(/\r/g, '').split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const abs = resolveUri(line, baseUrl);
+    if (abs) out.push(abs);
+  }
+  return out;
+}
+
+/**
+ * A "wrapper" is a tiny M3U that only points at another playlist — the classic
+ * PHP-proxy / portal pattern. It is NOT a real media playlist (no
+ * TARGETDURATION, no obvious .ts/.m4s segments) and not already a master
+ * (no STREAM-INF).
+ *
+ *  - one non-media URI  → follow it (handler unwraps)
+ *  - several playlist-like URIs → rewrite as a master so hls.js doesn't try
+ *    to demux the inner .m3u8 as a media segment
+ */
+export function isWrapperManifest(text: string, baseUrl: string): boolean {
+  if (!looksLikeHls(text)) return false;
+  if (/#EXT-X-STREAM-INF/i.test(text) || /#EXT-X-TARGETDURATION/i.test(text)) return false;
+  const uris = listUriLines(text, baseUrl);
+  if (uris.length === 0) return false;
+  if (uris.some((u) => isObviousMediaUrl(u))) return false;
+  if (uris.length === 1) return true;
+  return uris.every((u) => looksLikePlaylistUrl(u));
+}
+
+/** First URI of a wrapper playlist, already resolved. */
+export function firstWrapperUri(text: string, baseUrl: string): string | null {
+  return listUriLines(text, baseUrl)[0] ?? null;
+}
+
+/**
+ * Turn an EXTINF-wrapper into a real HLS master so players treat each URI as
+ * a variant playlist, not a media segment.
+ */
+export function convertWrapperToMaster(text: string): string {
+  const lines = text.replace(/\r/g, '').split('\n');
+  const out: string[] = ['#EXTM3U'];
+  let pendingName = '';
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (line.startsWith('#EXTM3U')) continue;
+    if (line.startsWith('#EXTINF')) {
+      const comma = line.lastIndexOf(',');
+      pendingName = (comma >= 0 ? line.slice(comma + 1) : '').trim();
+      continue;
+    }
+    if (line.startsWith('#')) continue;
+    if (!line.trim()) continue;
+    const name = pendingName.replace(/"/g, "'");
+    pendingName = '';
+    out.push(name ? `#EXT-X-STREAM-INF:BANDWIDTH=1,NAME="${name}"` : '#EXT-X-STREAM-INF:BANDWIDTH=1');
+    out.push(line.trim());
+  }
+  return out.join('\n') + '\n';
+}
+
+/**
+ * A PHP proxy sometimes returns the inner URL as a single plain-text line
+ * instead of an M3U. Treat that as a one-hop wrapper.
+ */
+export function looksLikeBareUpstreamUrl(text: string): string | null {
+  const t = text.trim();
+  if (!t || t.length > 2048 || /[\r\n<>]/.test(t)) return null;
+  if (!/^https?:\/\/\S+$/i.test(t)) return null;
+  return t;
 }
 
 export interface RewriteOptions {
@@ -91,41 +182,32 @@ export interface RewriteOptions {
   /** Parent capability boundary; descendants must never outlive it. */
   absoluteExpiry?: number;
   now?: number;
+  /** Inherited upstream request hints. */
+  rf?: string;
+  ua?: string;
+  xh?: string;
+}
+
+function mintOpts(opts: RewriteOptions): MintOptions {
+  return {
+    secret: opts.secret,
+    publicOrigin: opts.publicOrigin,
+    binding: opts.binding,
+    ...(opts.channelId ? { channelId: opts.channelId } : {}),
+    ...(opts.absoluteExpiry !== undefined ? { absoluteExpiry: opts.absoluteExpiry } : {}),
+    ...(opts.now !== undefined ? { now: opts.now } : {}),
+    ...(opts.rf ? { rf: opts.rf } : {}),
+    ...(opts.ua ? { ua: opts.ua } : {}),
+    ...(opts.xh ? { xh: opts.xh } : {}),
+  };
 }
 
 async function tokenUrl(opts: RewriteOptions, upstream: string, kind: 'm' | 's'): Promise<string> {
-  if (!isSafeUpstreamUrl(upstream)) throw new HlsError('unsafe manifest URI');
-  if (!isFetchablePort(upstream)) throw new HlsError('unsupported manifest URI port');
-  const now = opts.now ?? Math.floor(Date.now() / 1000);
-  const ttl = kind === 'm' ? DEFAULT_MANIFEST_TTL : SEGMENT_TTL;
-  // Quantized issue time + deterministic IV => the same upstream URI keeps the
-  // same proxied URL across manifest refreshes, so players reuse their buffer
-  // instead of re-downloading every segment. Identity is included in the seed,
-  // which both personalizes URLs and prevents deterministic GCM IV reuse across
-  // different payloads.
-  const iat = Math.floor(now / TOKEN_STABILITY_WINDOW) * TOKEN_STABILITY_WINDOW;
-  const binding = opts.binding ?? {};
-  const configuredExp = iat + ttl;
-  const exp =
-    opts.absoluteExpiry !== undefined && Number.isFinite(opts.absoluteExpiry)
-      ? Math.min(configuredExp, Math.floor(opts.absoluteExpiry))
-      : configuredExp;
-  const payload: TokenPayload = {
-    u: upstream,
-    iat,
-    exp,
-    k: kind,
-    ...(opts.channelId ? { c: opts.channelId } : {}),
-    ...binding,
-  };
-  const token = await createToken(
-    opts.secret,
-    payload,
-    `${kind}|${iat}|${exp}|${upstream}|${opts.channelId ?? ''}|${tokenBindingSeed(binding)}`,
-  );
-  if (kind === 'm') return `${opts.publicOrigin}/hls/${token}.m3u8`;
-  const ext = extOf(upstream);
-  return `${opts.publicOrigin}/seg/${token}${ext ? '.' + ext : ''}`;
+  try {
+    return await mintProxyUrl(mintOpts(opts), upstream, kind);
+  } catch (err) {
+    throw new HlsError(err instanceof MintError ? err.message : 'token mint failed');
+  }
 }
 
 async function rewriteAttrUri(line: string, opts: RewriteOptions, kind: 'm' | 's'): Promise<string> {
@@ -152,7 +234,12 @@ export async function rewriteManifest(text: string, opts: RewriteOptions): Promi
   if (text.length > MAX_MANIFEST_BYTES) throw new HlsError('manifest too large');
   if (!looksLikeHls(text)) throw new HlsError('not an HLS manifest');
 
-  const lines = text.replace(/\r/g, '').split('\n');
+  // Leftover EXTINF-wrappers (multi-URL, or a single URL we chose not to
+  // follow) become a real master so hls.js never tries to play an inner
+  // .m3u8 / .php playlist as a media segment.
+  const source = isWrapperManifest(text, opts.baseUrl) ? convertWrapperToMaster(text) : text;
+
+  const lines = source.replace(/\r/g, '').split('\n');
   const out: string[] = [];
   let nextIsChildManifest = false;
 

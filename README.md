@@ -140,8 +140,10 @@ GitHub M3U (playlists/tv.m3u)
 | `GET /p/{session}.m3u` | Session playlist with no username/password in the URL |
 | `GET /lg/{username}?{password}.m3u` | Legacy private playlist; requires D1 user/password, tokens bound to user |
 | `GET /epg/{token}.xml` | XMLTV via a dedicated EPG token with expiry/identity binding |
-| `GET /hls/{token}.m3u8` | HLS manifest proxy (rewrite + re-tokenize every child URI) |
+| `GET /hls/{token}.m3u8` | HLS manifest proxy (rewrite + re-tokenize every child URI; sniffs MPD bodies as DASH) |
+| `GET /mpd/{token}.mpd` | DASH/MPD manifest proxy (rewritten BaseURL + SegmentTemplate) |
 | `GET /seg/{token}[.ext]` | Media passthrough (ts/m4s/aac/mp4/key/vtt/subtitle) |
+| `GET /dseg/{token}/{path}` | DASH prefix passthrough (player expands `$Number$` / `$Time$`) |
 | `GET /player_api.php` | Xtream Codes API; always requires a real D1 user |
 | `GET /get.php` | Xtream M3U; always requires a real D1 user |
 | `GET /live/{user}/{pass}/{id}.m3u8` | Exchange Xtream credentials for a redirect to the opaque live URL |
@@ -373,7 +375,7 @@ npm install
 # 1. Create the D1 database and fill in database_id in wrangler.toml
 npx wrangler d1 create chrtv-db
 
-# 2. Run migrations (includes 0005 token identity, 0006 bans, 0007 sessions/audit)
+# 2. Run migrations (includes 0005–0008: identity, bans, sessions/audit, play_opts)
 npm run db:migrate          # remote
 npm run db:migrate:local    # local dev
 

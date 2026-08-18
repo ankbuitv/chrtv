@@ -70,6 +70,8 @@ export interface ChannelRow {
   category_name?: string | null;
   position: number;
   active: number;
+  /** JSON playback hints (#EXTVLCOPT / #KODIPROP). Empty string = none. */
+  play_opts?: string;
 }
 
 export interface UserRow {

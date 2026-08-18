@@ -5,7 +5,7 @@ import { buildPlaylist, playlistResponse } from './playlist/output';
 import { resolvePlaylistAccess } from './playlist/access';
 import { syncPlaylist } from './playlist/sync';
 import { runScheduledHealthCheck } from './playlist/health';
-import { handleHlsManifest, handleSegment } from './proxy/handlers';
+import { handleHlsManifest, handleMpdManifest, handleSegment, handleDashSegment } from './proxy/handlers';
 import { handlePlayerApi, handlePanelApi, handleGetPhp, handleXtreamLive, handleXtreamXmltv } from './xtream';
 import { handleTokenizedXmltv } from './epg';
 import { handleAdmin } from './admin';
@@ -41,8 +41,10 @@ import { getSettings } from './db/settings';
  *   GET  /p/{session}.m3u       revocable password-free user playlist
  *   GET  /lg/{user}?{pass}.m3u  legacy private D1-authenticated M3U
  *   GET  /epg/{token}.xml       identity-bound XMLTV EPG
- *   GET  /hls/{token}.m3u8      HLS manifest proxy (rewritten, tokenized)
+ *   GET  /hls/{token}.m3u8      HLS (or sniffed DASH) manifest proxy
+ *   GET  /mpd/{token}.mpd       DASH manifest proxy
  *   GET  /seg/{token}[.ext]     media/key/subtitle passthrough
+ *   GET  /dseg/{token}/{path}   DASH SegmentTemplate prefix passthrough
  *   GET  /player_api.php        authenticated Xtream Codes API
  *   GET  /get.php               authenticated Xtream M3U download
  *   GET  /live/{u}/{p}/{id}     authenticated Xtream live exchange
@@ -127,8 +129,10 @@ async function route(req: Request, env: Env, requestId: string): Promise<Respons
   }
   if (path.startsWith('/p/')) return handleSessionPlaylist(req, env, requestId, path.slice('/p/'.length));
 
-  // ---- HLS proxy ----
+  // ---- media proxy (HLS + DASH) ----
   if (path.startsWith('/hls/')) return handleHlsManifest(req, env, requestId, path.slice('/hls/'.length));
+  if (path.startsWith('/mpd/')) return handleMpdManifest(req, env, requestId, path.slice('/mpd/'.length));
+  if (path.startsWith('/dseg/')) return handleDashSegment(req, env, requestId, path.slice('/dseg/'.length));
   if (path.startsWith('/seg/')) return handleSegment(req, env, requestId, path.slice('/seg/'.length));
 
   // ---- Xtream Codes ----

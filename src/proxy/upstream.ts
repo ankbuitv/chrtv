@@ -1,8 +1,24 @@
 import { isSafeUpstreamUrl } from '../utils/urlsafe';
 import { isFetchablePort } from '../utils/ports';
-import { getClientIp } from '../token';
+import { getClientIp, type TokenPayload } from '../token';
 import { ErrorCodes, type ErrorCode } from '../errors/codes';
+import { parseTokenHeaders } from '../playlist/playOpts';
 import type { Env } from '../types';
+
+/** Upstream request hints inherited from the (encrypted) stream token. */
+export interface UpstreamHints {
+  rf?: string;
+  ua?: string;
+  xh?: string;
+}
+
+export function hintsFromPayload(payload: Pick<TokenPayload, 'rf' | 'ua' | 'xh'>): UpstreamHints {
+  const hints: UpstreamHints = {};
+  if (payload.rf) hints.rf = payload.rf;
+  if (payload.ua) hints.ua = payload.ua;
+  if (payload.xh) hints.xh = payload.xh;
+  return hints;
+}
 
 /**
  * Operator policy: an upstream is only declared dead after **30s of silence**.
@@ -152,6 +168,26 @@ function applyClientIpForward(headers: Headers, clientReq: Request, env?: Env): 
   headers.set('X-Real-IP', ip);
 }
 
+function applyHints(headers: Headers, url: string, hints?: UpstreamHints): void {
+  if (hints?.ua) headers.set('User-Agent', hints.ua);
+  // Default Referer is the origin of the URL being fetched — the usual
+  // anti-leech check. A playlist-declared Referer (token `rf`) wins, and is
+  // kept across redirect hops so a PHP proxy → CDN bounce still looks like
+  // it came from the proxy page.
+  if (hints?.rf) {
+    headers.set('Referer', hints.rf);
+  } else {
+    try {
+      headers.set('Referer', `${new URL(url).origin}/`);
+    } catch {
+      /* ignore */
+    }
+  }
+  for (const [name, value] of parseTokenHeaders(hints?.xh)) {
+    headers.set(name, value);
+  }
+}
+
 async function fetchOnce(
   url: string,
   clientReq: Request,
@@ -159,6 +195,7 @@ async function fetchOnce(
   deadline: number,
   kind: UpstreamKind,
   env?: Env,
+  hints?: UpstreamHints,
 ): Promise<UpstreamResult> {
   const headers = new Headers();
   for (const h of FORWARD_REQUEST_HEADERS) {
@@ -168,6 +205,7 @@ async function fetchOnce(
   headers.set('Accept-Encoding', 'identity');
   headers.set('User-Agent', clientReq.headers.get('user-agent') ?? 'CHRTV/1.0');
   applyClientIpForward(headers, clientReq, env);
+  applyHints(headers, url, hints);
 
   const cf = upstreamCacheCf(kind, method, headers);
 
@@ -241,15 +279,16 @@ export async function fetchUpstream(
   method: 'GET' | 'HEAD' = 'GET',
   kind: UpstreamKind = 'manifest',
   env?: Env,
+  hints?: UpstreamHints,
 ): Promise<UpstreamResult> {
   const timeoutMs = kind === 'manifest' ? MANIFEST_TIMEOUT_MS : SEGMENT_TIMEOUT_MS;
   // One deadline for everything: redirects AND the retry share it, so total
   // player-facing wait can never exceed the policy timeout.
   const deadline = Date.now() + timeoutMs;
-  const first = await fetchOnce(url, clientReq, method, deadline, kind, env);
+  const first = await fetchOnce(url, clientReq, method, deadline, kind, env, hints);
   if (first.ok || !isRetryable(first.code)) return first;
   if (deadline - Date.now() <= 0) return first;
-  return fetchOnce(url, clientReq, method, deadline, kind, env);
+  return fetchOnce(url, clientReq, method, deadline, kind, env, hints);
 }
 
 /** Build a passthrough media response — the body is streamed, never buffered. */

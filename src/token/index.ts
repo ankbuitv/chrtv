@@ -40,10 +40,16 @@ export interface TokenPayload extends TokenBinding {
   iat: number;
   /** Expiry (unix seconds) */
   exp: number;
-  /** Resource kind hint: m=manifest, s=segment/media, e=tokenized EPG */
-  k?: 'm' | 's' | 'e';
+  /** Resource kind: m=manifest (HLS or DASH), s=segment/media, e=EPG, b=DASH base prefix */
+  k?: 'm' | 's' | 'e' | 'b';
   /** Channel id (set on channel and descendant manifest/media tokens) */
   c?: string;
+  /** Referer to send upstream (encrypted). Inherited by descendant tokens. */
+  rf?: string;
+  /** User-Agent override to send upstream (encrypted). */
+  ua?: string;
+  /** Extra request headers (`Name:value` per line) to send upstream. */
+  xh?: string;
 }
 
 const encoder = new TextEncoder();
@@ -186,7 +192,7 @@ export type TokenResult =
   | { ok: false; code: 'TOKEN_INVALID' | 'TOKEN_EXPIRED' | 'UNSAFE_URL' };
 
 function validOptionalClaims(payload: TokenPayload): boolean {
-  if (payload.k !== undefined && payload.k !== 'm' && payload.k !== 's' && payload.k !== 'e') return false;
+  if (payload.k !== undefined && payload.k !== 'm' && payload.k !== 's' && payload.k !== 'e' && payload.k !== 'b') return false;
   if (payload.c !== undefined && (typeof payload.c !== 'string' || payload.c.length > 128)) return false;
   if (payload.ip !== undefined && (typeof payload.ip !== 'string' || payload.ip.length > 64 || !/^[0-9a-f:.]+$/i.test(payload.ip))) {
     return false;
@@ -199,6 +205,15 @@ function validOptionalClaims(payload: TokenPayload): boolean {
   // also prevents a malformed session-only token from bypassing ownership.
   if (payload.sid !== undefined && payload.uid === undefined) return false;
   if (payload.sid !== undefined && payload.aid !== undefined) return false;
+  if (payload.rf !== undefined) {
+    if (typeof payload.rf !== 'string' || payload.rf.length > 512 || !/^https?:\/\/\S+$/i.test(payload.rf)) return false;
+  }
+  if (payload.ua !== undefined) {
+    if (typeof payload.ua !== 'string' || payload.ua.length > 256 || /[\r\n]/.test(payload.ua)) return false;
+  }
+  if (payload.xh !== undefined) {
+    if (typeof payload.xh !== 'string' || payload.xh.length > 1024 || payload.xh.includes('\0')) return false;
+  }
   return true;
 }
 

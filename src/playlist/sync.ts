@@ -1,4 +1,5 @@
 import { parsePlaylist, PlaylistError } from './parser';
+import { serializePlayOpts } from './playOpts';
 import { sha256Hex } from '../utils/crypto';
 import { getSetting, setSetting } from '../db/settings';
 import type { Env } from '../types';
@@ -102,14 +103,14 @@ async function doSync(env: Env, trigger: 'cron' | 'admin', startedAt: number): P
       stmts.push(
         db
           .prepare(
-            `INSERT INTO channels (id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            `INSERT INTO channels (id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at, play_opts)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name, url = excluded.url, tvg_id = excluded.tvg_id, tvg_logo = excluded.tvg_logo,
                category_id = excluded.category_id, position = excluded.position, active = 1,
-               sync_seq = excluded.sync_seq, updated_at = excluded.updated_at`,
+               sync_seq = excluded.sync_seq, updated_at = excluded.updated_at, play_opts = excluded.play_opts`,
           )
-          .bind(ch.id, ch.name, ch.url, ch.tvgId, ch.tvgLogo, catId.get(ch.group) ?? null, ch.position, seq, nowSec, nowSec),
+          .bind(ch.id, ch.name, ch.url, ch.tvgId, ch.tvgLogo, catId.get(ch.group) ?? null, ch.position, seq, nowSec, nowSec, serializePlayOpts(ch.playOpts)),
       );
     }
     // Deactivate channels not present in this sync + assign xtream ids to new rows.
