@@ -23,6 +23,29 @@ Dán URL trên vào VLC / TiviMate / IPTV Smarters / OTT Navigator / Kodi — xo
 Không cần key, không cần token, không cần cấu hình gì thêm.
 (`/xem.m3u` là alias tương đương.)
 
+## Hoặc xem thẳng trên trình duyệt: `/xem`
+
+`https://YOUR_DOMAIN/xem` là web player tích hợp sẵn (hls.js, giao diện tối,
+lưới kênh có tìm kiếm + lọc nhóm + chọn chất lượng). Player phát đúng các
+manifest `/hls/` đã tokenized như `/tv.m3u` — kể cả link token cá nhân dạng
+`…/index.m3u8?token=…` mà bạn thêm vào `playlists/tv.m3u`.
+
+Sidebar còn có **ô dán link**: dán bất kỳ URL `.m3u8` nào (kèm query string
+`?token=…`) vào là CHRTV mint manifest proxy mã hoá có thời hạn cho link đó —
+tiện để **thử link token mới trước khi thêm vào playlist**. URL dán vào phải
+đi qua đúng các chặn SSRF/port như mọi fetch khác, không bao giờ hiện trong
+response, và lúc phát vẫn có đầy đủ rewrite manifest, fallback, circuit-breaker.
+
+- `POST /api/play {url}` → `{src: "/hls/{token}.m3u8", expires_at}` (6 giờ)
+- `GET /api/channels` → JSON lưới kênh cho player (cùng identity binding với
+  `/tv.m3u`; hỗ trợ `?key=…&mac=…` khi playlist bị khóa)
+- Tắt tính năng dán-link bằng `ALLOW_URL_PLAY=false`; mặc định cũng tắt khi
+  `PUBLIC_PLAYLIST=false` (bật lại tường minh bằng `ALLOW_URL_PLAY=true`).
+
+Link token có thời hạn. Khi link chết: sửa `playlists/tv.m3u` với URL mới,
+chờ sync kế tiếp (≤15 phút) hoặc bấm *Sync playlist* trong `/admin` — kênh
+(và `/xem`) tự động nhảy sang link mới.
+
 ## Kiến trúc
 
 ```
@@ -70,6 +93,10 @@ GitHub M3U (playlists/tv.m3u)
 | Route | Mô tả |
 |---|---|
 | `GET /` | Landing page (dark, minimal; không quảng bá URL playlist public) |
+| `GET /xem` | Web player tích hợp: lưới kênh + dán-link `.m3u8?token=…` để xem ngay |
+| `GET /ui/player.js` | Script web player (same-origin, không nhúng secret) |
+| `GET /api/channels` | JSON lưới kênh cho player (binding như `/tv.m3u`) |
+| `POST /api/play` | Mint manifest proxy 6 giờ cho một URL m3u8 dán vào (`ALLOW_URL_PLAY`) |
 | `GET /login` | Portal user: đăng nhập, copy M3U, xem/revoke session/device |
 | `GET /admin` | Dashboard bảo mật: users, sessions, audit, bans, keys/devices, health/sync |
 | `GET /tv.m3u`, `/xem.m3u` | Playlist public chính (tuỳ chọn `?key=chr_…&mac=AA:BB:…`; token tự bind MAC/key/user) |

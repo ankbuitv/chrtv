@@ -22,6 +22,8 @@ export const ErrorCodes = {
   UNSUPPORTED_PORT: 'UNSUPPORTED_PORT',
   INVALID_HLS: 'INVALID_HLS',
   UNSAFE_URL: 'UNSAFE_URL',
+  /** Arbitrary-URL playback (/api/play) is disabled by configuration. */
+  URL_PLAY_DISABLED: 'URL_PLAY_DISABLED',
   DB_ERROR: 'DB_ERROR',
   CONFIG_ERROR: 'CONFIG_ERROR',
   INTERNAL_ERROR: 'INTERNAL_ERROR',

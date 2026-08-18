@@ -1946,3 +1946,137 @@ describe('admin health visibility', () => {
     expect(res.status).toBe(405);
   });
 });
+
+describe('web player /xem', () => {
+  it('serves the player page with a strict CSP and its same-origin script', async () => {
+    const res = await SELF.fetch(`${BASE}/xem`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('text/html');
+    const csp = res.headers.get('Content-Security-Policy') ?? '';
+    expect(csp).toContain("script-src 'self' https://cdn.jsdelivr.net");
+    expect(csp).toContain("connect-src 'self'");
+    const body = await res.text();
+    expect(body).toContain('/ui/player.js');
+    expect(body).toContain('cdn.jsdelivr.net/npm/hls.js');
+    expect(body).toContain('id="paste-url"'); // paste-and-play box for token links
+    expect(body).toContain('id="video"');
+
+    const js = await SELF.fetch(`${BASE}/ui/player.js`);
+    expect(js.status).toBe(200);
+    expect(js.headers.get('Content-Type')).toContain('javascript');
+    const script = await js.text();
+    expect(script).toContain("fetch('/api/channels'");
+    expect(script).not.toContain('SECRET');
+  });
+
+  it('the landing page links to the web player', async () => {
+    const res = await SELF.fetch(`${BASE}/`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('href="/xem"');
+  });
+
+  it('GET /api/channels returns the same tokenized entries as /tv.m3u without leaking upstreams', async () => {
+    await seedChannels();
+    const ip = '192.0.2.77';
+    const res = await SELF.fetch(`${BASE}/api/channels`, { headers: { 'CF-Connecting-IP': ip } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('application/json');
+    const raw = await res.text();
+    expect(raw).not.toContain('up.example.com'); // upstream never exposed
+    const body = JSON.parse(raw) as { count: number; epg: string; channels: Array<{ id: string; name: string; group: string; url: string }> };
+    expect(body.count).toBeGreaterThanOrEqual(2);
+    expect(body.epg).toContain(`${BASE}/epg/`);
+    const vtv1 = body.channels.find((c) => c.name === 'VTV1')!;
+    expect(vtv1.group).toBe('News');
+    expect(vtv1.url.startsWith(`${BASE}/hls/`)).toBe(true);
+    const token = vtv1.url.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+    const verdict = await verifyToken(env.SECRET_KEY, token);
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) {
+      expect(verdict.payload).toMatchObject({ u: 'https://up.example.com/live/vtv1/index.m3u8', k: 'm', c: 'aaaaaaaaaaaaaaa1', ip });
+    }
+    const event = await env.DB.prepare(
+      "SELECT event_type, route, outcome FROM auth_events WHERE route = '/api/channels' ORDER BY id DESC LIMIT 1",
+    ).first<{ event_type: string; route: string; outcome: string }>();
+    expect(event).toEqual({ event_type: 'playlist', route: '/api/channels', outcome: 'success' });
+  });
+
+  it('rejects wrong methods on the player APIs', async () => {
+    expect((await SELF.fetch(`${BASE}/api/channels`, { method: 'POST' })).status).toBe(405);
+    expect((await SELF.fetch(`${BASE}/api/play`)).status).toBe(405);
+  });
+
+  it('POST /api/play mints a playable proxy manifest for a ?token= link and proxies its media', async () => {
+    const manifest = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:3',
+      '#EXT-X-TARGETDURATION:6',
+      '#EXTINF:6.0,',
+      'seg001.ts',
+      '#EXT-X-ENDLIST',
+    ].join('\n');
+    fetchMock
+      .get('https://playtok.example.com')
+      .intercept({ path: /\/api\/stream\/GETftplay\/SEJP\/index\.m3u8/ })
+      .reply(200, manifest, { headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } });
+
+    const pasted = 'https://playtok.example.com/api/stream/GETftplay/SEJP/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH';
+    const ip = '203.0.113.9';
+    const res = await SELF.fetch(`${BASE}/api/play`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip },
+      body: JSON.stringify({ url: pasted }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { src: string; expires_at: number };
+    expect(body.src.startsWith(`${BASE}/hls/`)).toBe(true);
+    expect(body.expires_at).toBeGreaterThan(Math.floor(Date.now() / 1000));
+    // The pasted upstream URL (query token included) travels only inside the token.
+    expect(JSON.stringify(body)).not.toContain('playtok.example.com');
+
+    const token = body.src.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+    const verdict = await verifyToken(env.SECRET_KEY, token);
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) {
+      expect(verdict.payload.u).toBe(pasted); // ?token=… preserved end to end
+      expect(verdict.payload.k).toBe('m');
+    }
+
+    // Identity binding holds: same IP plays, a different IP is rejected.
+    const play = await SELF.fetch(body.src, { headers: { 'CF-Connecting-IP': ip } });
+    expect(play.status).toBe(200);
+    const played = await play.text();
+    expect(played).toContain(`${BASE}/seg/`);
+    expect(played).not.toContain('playtok.example.com');
+
+    const stolen = await SELF.fetch(body.src, { headers: { 'CF-Connecting-IP': '203.0.113.10' } });
+    expect(stolen.status).toBe(403);
+  });
+
+  it('POST /api/play rejects unsafe URLs, unsupported ports, and junk payloads', async () => {
+    const cases: Array<[string, string]> = [
+      ['http://127.0.0.1/x.m3u8', 'UNSAFE_URL'],
+      ['https://localhost/live.m3u8', 'UNSAFE_URL'],
+      ['http://169.254.169.254/latest/meta-data', 'UNSAFE_URL'],
+      ['http://chrtv.duckdns.org:30113/hls/master.m3u8', 'UNSUPPORTED_PORT'],
+      ['not a url', 'UNSAFE_URL'],
+    ];
+    for (const [url, code] of cases) {
+      const res = await SELF.fetch(`${BASE}/api/play`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe(code);
+    }
+    for (const body of ['{', '{"url":123}', '{}']) {
+      const res = await SELF.fetch(`${BASE}/api/play`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      expect(res.status).toBe(400);
+    }
+  });
+});

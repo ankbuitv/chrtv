@@ -24,6 +24,31 @@ Paste that URL into VLC / TiviMate / IPTV Smarters / OTT Navigator / Kodi —
 done. No key, no token, no extra configuration required.
 (`/xem.m3u` is an equivalent alias.)
 
+## Or just watch in the browser: `/xem`
+
+`https://YOUR_DOMAIN/xem` is a built-in web player (hls.js, dark UI, channel
+grid with search + group filter + quality picker). It plays the exact same
+tokenized `/hls/` manifests `/tv.m3u` serves — including personal token links
+like `…/index.m3u8?token=…` that you add to `playlists/tv.m3u`.
+
+The sidebar also has a **paste box**: drop any `.m3u8` URL (query string and
+`?token=…` included) and CHRTV mints a short-lived encrypted proxy manifest for
+it — handy for trying a fresh token link *before* committing it to the
+playlist. The pasted URL passes the same SSRF/port guards as everything else,
+never appears in any response, and playback gets the usual manifest rewriting,
+fallback, and circuit-breaker behaviour.
+
+- `POST /api/play {url}` → `{src: "/hls/{token}.m3u8", expires_at}` (6h)
+- `GET /api/channels` → JSON channel grid for the player (same identity
+  binding as `/tv.m3u`; supports `?key=…&mac=…` on locked-down deployments)
+- Disable paste-and-play with `ALLOW_URL_PLAY=false`; it is also off by
+  default when `PUBLIC_PLAYLIST=false` (opt back in explicitly with
+  `ALLOW_URL_PLAY=true`).
+
+Token links expire. When one dies: edit `playlists/tv.m3u` with the new URL,
+wait for the next sync (≤15 min) or press *Sync playlist* in `/admin`, and the
+channel (and `/xem`) pick it up automatically.
+
 ## Architecture
 
 ```
@@ -92,6 +117,10 @@ GitHub M3U (playlists/tv.m3u)
 | Route | Description |
 |---|---|
 | `GET /` | Landing page (dark, minimal; doesn't advertise the public playlist URL) |
+| `GET /xem` | Built-in web player: channel grid + paste-and-play for `.m3u8?token=…` links |
+| `GET /ui/player.js` | Web player script (same-origin, no secrets embedded) |
+| `GET /api/channels` | JSON channel grid for the player (same binding as `/tv.m3u`) |
+| `POST /api/play` | Mint a 6h proxy manifest for one pasted m3u8 URL (`ALLOW_URL_PLAY`) |
 | `GET /login` | User portal: log in, copy M3U, view/revoke sessions & devices |
 | `GET /admin` | Security dashboard: users, sessions, audit, bans, keys/devices, health/sync |
 | `GET /tv.m3u`, `/xem.m3u` | Main public playlist (optional `?key=chr_…&mac=AA:BB:…`; tokens bind MAC/key/user) |

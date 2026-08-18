@@ -26,6 +26,11 @@ EPG_URL = "https://epg.io.vn/epgc.xml"
 # EPG remain tokenized; never an open proxy). Xtream, /lg, and POST /api/login
 # always require a real active D1 user regardless of this setting.
 PUBLIC_PLAYLIST = "true"
+# Paste-and-play (POST /api/play) for the /xem web player: mint a 6h proxy
+# manifest for an operator-supplied .m3u8?token=… link. Commented out = follows
+# PUBLIC_PLAYLIST (on here, off when PUBLIC_PLAYLIST=false). Set "true" to
+# force-enable on a locked-down deployment, "false" to disable everywhere.
+# ALLOW_URL_PLAY = "true"
 # Claims embedded in stream tokens. Choose any comma-separated subset of
 # ip,mac,user,key; use "none" only when identity binding is intentionally off.
 # Invalid values fall back to this secure all-claims default.

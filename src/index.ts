@@ -2,13 +2,13 @@ import type { Env } from './types';
 import { getRequestId, errorResponse, methodNotAllowed, corsPreflight, logEvent } from './utils/http';
 import { ErrorCodes } from './errors/codes';
 import { buildPlaylist, playlistResponse } from './playlist/output';
+import { resolvePlaylistAccess } from './playlist/access';
 import { syncPlaylist } from './playlist/sync';
 import { runScheduledHealthCheck } from './playlist/health';
 import { handleHlsManifest, handleSegment } from './proxy/handlers';
 import { handlePlayerApi, handlePanelApi, handleGetPhp, handleXtreamLive, handleXtreamXmltv } from './xtream';
 import { handleTokenizedXmltv } from './epg';
 import { handleAdmin } from './admin';
-import { authenticateAccessKey } from './auth';
 import { handlePrivateLogin } from './auth/privateLogin';
 import { handleAccountApi, handleLoginApi, handleSessionPlaylist } from './auth/loginApi';
 import { recordAuthEvent } from './auth/audit';
@@ -22,8 +22,9 @@ import {
 } from './security/honeypot';
 import { landingPage, notFoundPage } from './pages';
 import { adminDashboardPage, loginPortalPage, portalScript } from './pages/portals';
+import { playerPage, playerScript } from './pages/player';
+import { handleChannelsApi, handlePlayApi } from './player';
 import { getSettings } from './db/settings';
-import { requestTokenBinding } from './token';
 
 /**
  * CHRTV — Cloud IPTV Gateway (Cloudflare Workers + D1)
@@ -31,6 +32,10 @@ import { requestTokenBinding } from './token';
  * Public routes
  *   GET  /                      landing page
  *   GET  /login, /admin         browser portals
+ *   GET  /xem                   built-in web player (channel grid + paste-and-play)
+ *   GET  /ui/player.js          web player script
+ *   GET  /api/channels          channel grid JSON for the web player
+ *   POST /api/play              paste-and-play: mint a proxy manifest for one m3u8 URL
  *   GET  /tv.m3u, /xem.m3u      public-configurable main playlist
  *   POST /api/login             opaque M3U session exchange
  *   GET  /p/{session}.m3u       revocable password-free user playlist
@@ -58,53 +63,14 @@ async function handlePlaylistRoute(req: Request, env: Env, requestId: string): P
   if (req.method === 'OPTIONS') return corsPreflight();
   if (!STREAM_METHODS.includes(req.method)) return methodNotAllowed(STREAM_METHODS, requestId);
 
+  // Shared access resolution (identical policy for /tv.m3u and /api/channels):
+  // key always validated when supplied, anonymous only when PUBLIC_PLAYLIST,
+  // and tokens personalized by every trustworthy identity available here.
+  const access = await resolvePlaylistAccess(req, env, requestId, '/tv.m3u');
+  if (!access.ok) return access.response;
+  const { binding, playlistExpiry, userId, username } = access.access;
+
   const url = new URL(req.url);
-  const publicPlaylist = (env.PUBLIC_PLAYLIST ?? 'true').toLowerCase() !== 'false';
-  const key = url.searchParams.get('key') ?? url.searchParams.get('access_key');
-  const mac = url.searchParams.get('mac');
-
-  let accessKeyId: number | undefined;
-  let userId: number | undefined;
-  let username: string | undefined;
-  let playlistExpiry: number | null | undefined;
-  if (key) {
-    // A key was supplied: always validate it (and register the device by MAC).
-    const auth = await authenticateAccessKey(env, key, mac, req.headers.get('user-agent') ?? '');
-    if (!auth.ok) {
-      logEvent(requestId, url.pathname, auth.code);
-      await recordAuthEvent(req, env, {
-        eventType: 'access_key',
-        route: url.pathname,
-        outcome: 'failure',
-      });
-      return errorResponse(auth.code, auth.status, requestId);
-    }
-    accessKeyId = auth.value.id;
-    userId = auth.value.user_id ?? undefined;
-    username = auth.value.username || undefined;
-    playlistExpiry = auth.value.expires_at;
-    await recordAuthEvent(req, env, {
-      userId: auth.value.user_id,
-      username: auth.value.username,
-      eventType: 'access_key',
-      route: url.pathname,
-      outcome: 'success',
-    });
-  } else if (!publicPlaylist) {
-    logEvent(requestId, url.pathname, ErrorCodes.KEY_INVALID, 'key required');
-    await recordAuthEvent(req, env, {
-      eventType: 'playlist',
-      route: url.pathname,
-      outcome: 'failure',
-    });
-    return errorResponse(ErrorCodes.KEY_INVALID, 401, requestId);
-  }
-
-  // The encrypted channel tokens are personalized by every trustworthy identity
-  // available here. IP is observed by Cloudflare and strictly enforced on
-  // subsequent media requests; MAC is client-declared and normalized; user/key
-  // ids come only from authenticated D1 records.
-  const binding = requestTokenBinding(req, { rawMac: mac, userId, accessKeyId }, env.TOKEN_BINDING);
   const body = await buildPlaylist(env, url.origin, binding, playlistExpiry);
   await recordAuthEvent(req, env, {
     userId,
@@ -125,6 +91,12 @@ async function route(req: Request, env: Env, requestId: string): Promise<Respons
   if (path === '/admin' && (req.method === 'GET' || req.method === 'HEAD')) return adminDashboardPage();
   if (path === '/ui/login.js' && req.method === 'GET') return portalScript('login');
   if (path === '/ui/admin.js' && req.method === 'GET') return portalScript('admin');
+
+  // ---- built-in web player: watch any channel (or a pasted token link) in the browser ----
+  if (path === '/xem' && (req.method === 'GET' || req.method === 'HEAD')) return playerPage();
+  if (path === '/ui/player.js' && req.method === 'GET') return playerScript();
+  if (path === '/api/channels') return handleChannelsApi(req, env, requestId);
+  if (path === '/api/play') return handlePlayApi(req, env, requestId);
 
   // ---- safe credential exchange + user session self-service ----
   if (path === '/api/login') return handleLoginApi(req, env, requestId);
