@@ -79,6 +79,11 @@ GitHub M3U (playlists/tv.m3u)
 - **Circuit breaker**: upstream failure → 30s failure state in the Cloudflare
   cache; within the TTL the fallback manifest is served immediately, after the
   TTL it retries automatically.
+- **The fallback is a LIVE placeholder, not a dead end**: when an upstream
+  hiccups, CHRTV serves a valid empty *live* playlist (no `#EXT-X-ENDLIST`).
+  VLC/TiviMate/hls.js keep polling and the channel comes back on its own when
+  the upstream recovers — instead of the player declaring the stream "ended"
+  and forcing you to re-open the channel after every one-second blip.
 - **Channel health sweep**: cron `*/10 * * * *` proactively probes a small batch
   of channels (oldest-checked first) and marks `channel_health`
   online/offline/unknown → surfaced via `/api/admin/offline` +
@@ -88,6 +93,11 @@ GitHub M3U (playlists/tv.m3u)
   confirmed. Every case where the server still answers — 5xx,
   401/403/429/451 (auth/geo-block/rate-limit), 200 + non-HLS body
   (anti-bot page) — is `unknown`, never falsely flagged offline.
+  Credential-bearing personal links (`?token=…`, `?sign=…`, portal/MAC query
+  credentials) are **never probed**: a sweep hitting them from a random
+  Cloudflare colo looks exactly like account sharing to relay/portal
+  anti-abuse and can get the link throttled or banned. They stay `unknown`
+  with code `PERSONAL_LINK` (`HEALTH_PROBE_CREDENTIAL_LINKS=true` opts back in).
 - **Safe playlist sync**: a broken new playlist keeps the previous version and
   marks the sync failed. Unchanged hash → no DB writes.
 - **Safe session login**: `POST /api/login` exchanges username/password for a
@@ -458,8 +468,29 @@ the same non-disclosure rules apply to curl, players and browsers alike.
   same URL. Only the FIRST request pays the 10–25s slow-relay TTFB; player
   retries, second viewers and ABR-ladder switches get it straight from cache —
   a big drop in "video loading too long" when several people watch at once.
-  Manifests are never cached (live playlists change constantly) and Range
+  Caching is status-aware: only 2xx bodies are ever stored, so one transient
+  upstream 4xx/5xx is not replayed to every viewer for the whole TTL. Range
   requests go straight upstream.
+- **4s edge micro-cache for manifests** (and short-lived redirect hops):
+  a channel open costs two sequential upstream fetches, and live polling hits
+  the relay again every few seconds. The 4s window collapses simultaneous
+  viewers + rapid polling into ~1 upstream fetch per colo — fewer parallel
+  connections against per-token anti-abuse limits, and a noticeably faster
+  zap-back to a recently watched channel — while staying far inside any live
+  window. Conditional headers (`If-None-Match`/`If-Modified-Since`) are never
+  forwarded upstream: an empty-body 304 through a shared cache would poison
+  playback.
+- **`FORWARD_CLIENT_IP=true` for operator-owned relays**: relays that
+  authorize/geo-fence/rate-limit per client IP (MAC portals, playnow-style
+  boxes) otherwise see a Cloudflare datacenter address that changes per colo —
+  direct VLC from home then works while the *same link* through the proxy gets
+  403s or "Upstream HTTP 403" pages. With the flag on, the real viewer IP is
+  attached as `X-Forwarded-For`/`X-Real-IP` so the relay applies its rules to
+  the actual viewer. If the *seller's* server firewalls datacenter IPs
+  entirely (check `/admin` → failures: `UPSTREAM_UNREACHABLE`/`UPSTREAM_TIMEOUT`
+  while VLC at home plays fine), no worker code can bypass that — have your
+  relay proxy the bytes through instead of 302-redirecting to the raw
+  IP:port origin.
 - **One retry** for fast transient failures (network / 5xx) before the circuit
   breaker opens — but only with whatever is left of the 30s budget. A timeout
   is already conclusive, so it is **not retried** (avoids stretching to 60s

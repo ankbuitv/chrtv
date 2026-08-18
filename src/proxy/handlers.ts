@@ -76,7 +76,7 @@ async function serveFallbackManifest(
       continue;
     }
 
-    const upstream = await fetchUpstream(fallbackUrl, req, 'GET', 'manifest');
+    const upstream = await fetchUpstream(fallbackUrl, req, 'GET', 'manifest', env);
     if (!upstream.ok) {
       logEvent(requestId, '/hls', 'FALLBACK_FETCH_FAILED', upstream.code);
       continue;
@@ -170,7 +170,7 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
     return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp, failed.code);
   }
 
-  const upstream = await fetchUpstream(payload.u, req, 'GET', 'manifest');
+  const upstream = await fetchUpstream(payload.u, req, 'GET', 'manifest', env);
   if (!upstream.ok) {
     logEvent(requestId, '/hls', upstream.code, `status=${upstream.status}`);
     await setFailure(fkey, { code: upstream.code, status: upstream.status, at: Date.now() });
@@ -246,7 +246,7 @@ export async function handleSegment(req: Request, env: Env, requestId: string, r
   }
 
   const isHead = req.method === 'HEAD';
-  const upstream = await fetchUpstream(verdict.payload.u, req, isHead ? 'HEAD' : 'GET', 'segment');
+  const upstream = await fetchUpstream(verdict.payload.u, req, isHead ? 'HEAD' : 'GET', 'segment', env);
   if (!upstream.ok) {
     logEvent(requestId, '/seg', upstream.code, `status=${upstream.status}`);
     // Media failures return real HTTP errors; players re-request the manifest,

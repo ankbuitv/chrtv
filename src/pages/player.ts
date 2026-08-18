@@ -106,7 +106,14 @@ function play(src,title){
   qualityEl.innerHTML='<option value="-1">Tự động</option>';
   const native=video.canPlayType('application/vnd.apple.mpegurl');
   if(window.Hls&&Hls.isSupported()){
-    hls=new Hls({enableWorker:true,liveSyncDurationCount:3,fragLoadingMaxRetry:4,manifestLoadingMaxRetry:2});
+    // Timeouts mirror the gateway's declared 30s upstream policy: slow relays
+    // routinely spend 10-25s to first byte, and hls.js defaults (10s manifest/
+    // level, 20s fragment) would abort the request while CHRTV is still
+    // waiting on the upstream — producing a fake "mất kết nối" retry loop
+    // instead of a slow-but-successful tune-in.
+    hls=new Hls({enableWorker:true,liveSyncDurationCount:3,
+      manifestLoadingTimeOut:30000,levelLoadingTimeOut:30000,fragLoadingTimeOut:30000,
+      manifestLoadingMaxRetry:3,levelLoadingMaxRetry:4,fragLoadingMaxRetry:6});
     hls.on(Hls.Events.MANIFEST_PARSED,()=>{setMsg('');setState('Đang phát ●','ok');video.play().catch(()=>{})});
     hls.on(Hls.Events.LEVEL_SWITCHED,(e,d)=>{const auto=qualityEl.value==='-1';const idx=auto?d.level:Number(qualityEl.value);const l=hls.levels[idx];if(l)setState((auto?'Tự động · ':'')+(l.height?l.height+'p':Math.round((l.bitrate||0)/1000)+'kbps'),'ok')});
     hls.on(Hls.Events.ERROR,(e,d)=>{

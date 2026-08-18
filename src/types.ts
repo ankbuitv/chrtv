@@ -39,6 +39,22 @@ export interface Env {
    * at the cost of more upstream subrequests per invocation.
    */
   HEALTH_CHECK_BATCH?: string;
+  /**
+   * "true" => the health sweep also probes credential-bearing personal links
+   * (`?token=…`, `?sign=…`). Default off, because random-colo probes on such
+   * links trip relay/portal anti-abuse ("one credential, many datacenter
+   * IPs") and can throttle or ban the viewer's link.
+   */
+  HEALTH_PROBE_CREDENTIAL_LINKS?: string;
+  /**
+   * "true" => attach the Cloudflare-observed viewer IP as X-Forwarded-For /
+   * X-Real-IP on upstream manifest/segment fetches. For operator-owned relays
+   * that authorize, geo-fence or rate-limit per client IP; without it they
+   * see a (per-colo varying) Cloudflare datacenter address instead of the
+   * actual viewer. Off by default (privacy); only enable for trusted
+   * upstreams.
+   */
+  FORWARD_CLIENT_IP?: string;
   /** Test-only: D1 migrations injected by vitest-pool-workers. */
   TEST_MIGRATIONS?: unknown;
 }

@@ -3,7 +3,7 @@ import { SELF, env, fetchMock } from 'cloudflare:test';
 import { createToken, verifyToken } from '../src/token';
 import { syncPlaylist } from '../src/playlist/sync';
 import { probeChannel, healthCheckBatch, MAX_PROBES_PER_RUN } from '../src/playlist/health';
-import { handleHlsManifest } from '../src/proxy/handlers';
+import { handleHlsManifest, handleSegment } from '../src/proxy/handlers';
 import { handleSessionPlaylist } from '../src/auth/loginApi';
 import { hashPassword, hmacHex, randomHex } from '../src/utils/crypto';
 
@@ -583,7 +583,8 @@ describe('/tv.m3u playlist', () => {
     expect(stream.headers.get('Location')).toBeNull();
     expect(stream.headers.get('X-CHRTV-Fallback')).toBe('1');
     const streamBody = await stream.text();
-    expect(streamBody).toContain('#EXT-X-ENDLIST');
+    expect(streamBody).toContain('#EXTM3U');
+    expect(streamBody).not.toContain('#EXT-X-ENDLIST'); // live fallback: player keeps retrying
     expect(streamBody).not.toContain(upstream);
     expect(streamBody).not.toContain('chrtv.duckdns.org');
   });
@@ -1103,7 +1104,7 @@ describe('HLS proxy', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('X-CHRTV-Fallback')).toBe('1');
     const body = await res.text();
-    expect(body).toContain('#EXT-X-ENDLIST');
+    expect(body).not.toContain('#EXT-X-ENDLIST');
     expect(body).not.toContain('169.254.169.254');
     expect(body).not.toContain('/seg/');
   });
@@ -1204,7 +1205,7 @@ describe('HLS proxy', () => {
     expect(res.headers.get('X-CHRTV-Fallback')).toBe('1');
     const body = await res.text();
     expect(body).toContain('#EXTM3U');
-    expect(body).toContain('#EXT-X-ENDLIST');
+    expect(body).not.toContain('#EXT-X-ENDLIST');
     expect(body).not.toContain('dead1');
     // durable failure recorded for admin
     const failures = await env.DB.prepare("SELECT * FROM stream_failures WHERE channel_id = 'deadchannel0001x'").all();
@@ -1317,7 +1318,7 @@ describe('HLS proxy', () => {
     expect(res.headers.get('Location')).toBeNull();
     expect(res.headers.get('X-CHRTV-Fallback')).toBe('1');
     const body = await res.text();
-    expect(body).toContain('#EXT-X-ENDLIST');
+    expect(body).not.toContain('#EXT-X-ENDLIST');
     expect(body).not.toContain('chrtv.duckdns.org');
     expect(body).not.toContain(':30113');
   });
@@ -1361,7 +1362,7 @@ describe('HLS proxy', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('Location')).toBeNull();
     const body = await res.text();
-    expect(body).toContain('#EXT-X-ENDLIST');
+    expect(body).not.toContain('#EXT-X-ENDLIST');
     expect(body).not.toContain('chrtv.duckdns.org');
     expect(body).not.toContain(':30113');
   });
@@ -1373,7 +1374,7 @@ describe('HLS proxy', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('X-CHRTV-Fallback')).toBe('1');
     const body = await res.text();
-    expect(body).toContain('#EXT-X-ENDLIST');
+    expect(body).not.toContain('#EXT-X-ENDLIST');
     expect(body).not.toContain('/seg/');
   });
 
@@ -1442,7 +1443,8 @@ describe('HLS proxy', () => {
     expect(stream.status).toBe(200);
     expect(stream.headers.get('Location')).toBeNull();
     const body = await stream.text();
-    expect(body).toContain('#EXT-X-ENDLIST');
+    expect(body).toContain('#EXTM3U');
+    expect(body).not.toContain('#EXT-X-ENDLIST'); // live fallback: player keeps retrying
     expect(body).not.toContain('chrtv.duckdns.org');
     expect(body).not.toContain(':18483');
   });
@@ -2080,3 +2082,154 @@ describe('web player /xem', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Personal credential links, client-IP forwarding opt-in, live fallback
+// ---------------------------------------------------------------------------
+
+describe('credential-bearing personal links', () => {
+  // Storage is isolated per test — each case seeds its own channel row.
+  async function seedTokenChannel(id: string, xtreamId: number): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    await resetChannels();
+    await env.DB.prepare(
+      `INSERT INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at)
+       VALUES (?, ?, 'H-Token', 'https://htoken.example.com/api/stream/CH/index.m3u8?token=abcdef123456', '', '', 1, 0, 1, 9, ?, ?)`,
+    )
+      .bind(id, xtreamId, now, now)
+      .run();
+  }
+
+  it('health sweep NEVER pings a ?token= channel (random-colo probes trip relay anti-abuse)', async () => {
+    await seedTokenChannel('cafebabe00000099', 200099);
+    // No interceptor is registered and disableNetConnect() is active: if the
+    // sweep fetched anyway, the probe would fail with an UPSTREAM_* code —
+    // never PERSONAL_LINK — and the assertions below would expose it.
+    const summary = await healthCheckBatch(env, 10);
+    expect(summary).toEqual({ checked: 1, online: 0, offline: 0, unknown: 1 });
+    const row = await env.DB
+      .prepare("SELECT status, error_code, fail_streak, checked_at FROM channel_health WHERE channel_id = 'cafebabe00000099'")
+      .first<{ status: string; error_code: string; fail_streak: number; checked_at: number }>();
+    expect(row).toMatchObject({ status: 'unknown', error_code: 'PERSONAL_LINK', fail_streak: 0 });
+    // Marked checked, so the rotation does not keep selecting the same
+    // unprobeable channels on every sweep.
+    expect(row!.checked_at).toBeGreaterThan(0);
+  });
+
+  it('HEALTH_PROBE_CREDENTIAL_LINKS=true opts back into probing token links', async () => {
+    await seedTokenChannel('cafebabe00000098', 200098);
+    fetchMock
+      .get('https://htoken.example.com')
+      .intercept({ path: '/api/stream/CH/index.m3u8?token=abcdef123456' })
+      .reply(200, HLS_OK, { headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } });
+    const summary = await healthCheckBatch({ ...env, HEALTH_PROBE_CREDENTIAL_LINKS: 'true' }, 10);
+    expect(summary).toEqual({ checked: 1, online: 1, offline: 0, unknown: 0 });
+  });
+});
+
+describe('upstream client-IP forwarding (opt-in, for operator-owned relays)', () => {
+  async function mintSegToken(upstream: string): Promise<string> {
+    const now = Math.floor(Date.now() / 1000);
+    return createToken(env.SECRET_KEY, { u: upstream, iat: now, exp: now + 300, k: 's' });
+  }
+
+  it('sends no X-Forwarded-For/X-Real-IP by default', async () => {
+    const token = await mintSegToken('https://fwdip.example.com/seg1.ts');
+    fetchMock
+      .get('https://fwdip.example.com')
+      .intercept({
+        path: '/seg1.ts',
+        headers: (h) => h['x-forwarded-for'] === undefined && h['x-real-ip'] === undefined,
+      })
+      .reply(200, 'TSDATA', { headers: { 'Content-Type': 'video/mp2t' } });
+    const res = await handleSegment(
+      new Request(`${BASE}/seg/${token}.ts`, { headers: { 'CF-Connecting-IP': '203.0.113.9' } }),
+      env,
+      'req-fwd-default',
+      `${token}.ts`,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('TSDATA');
+  });
+
+  it('FORWARD_CLIENT_IP=true attaches the viewer IP on upstream fetches', async () => {
+    const token = await mintSegToken('https://fwdip.example.com/seg2.ts');
+    fetchMock
+      .get('https://fwdip.example.com')
+      .intercept({
+        path: '/seg2.ts',
+        headers: (h) => h['x-forwarded-for'] === '203.0.113.9' && h['x-real-ip'] === '203.0.113.9',
+      })
+      .reply(200, 'TSDATA', { headers: { 'Content-Type': 'video/mp2t' } });
+    const res = await handleSegment(
+      new Request(`${BASE}/seg/${token}.ts`, { headers: { 'CF-Connecting-IP': '203.0.113.9' } }),
+      { ...env, FORWARD_CLIENT_IP: 'true' },
+      'req-fwd-on',
+      `${token}.ts`,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('TSDATA');
+  });
+
+  it('FORWARD_CLIENT_IP=true also applies to manifest fetches', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await createToken(env.SECRET_KEY, { u: 'https://fwdip.example.com/live.m3u8', iat: now, exp: now + 300, k: 'm' });
+    fetchMock
+      .get('https://fwdip.example.com')
+      .intercept({
+        path: '/live.m3u8',
+        headers: (h) => h['x-forwarded-for'] === '203.0.113.9',
+      })
+      .reply(200, HLS_OK, { headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } });
+    const res = await handleHlsManifest(
+      new Request(`${BASE}/hls/${token}.m3u8`, { headers: { 'CF-Connecting-IP': '203.0.113.9' } }),
+      { ...env, FORWARD_CLIENT_IP: 'true' },
+      'req-fwd-manifest',
+      token,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get('X-CHRTV-Fallback')).toBeNull();
+  });
+
+  it('never forwards a spoofed X-Forwarded-For supplied by the client itself', async () => {
+    const token = await mintSegToken('https://fwdip.example.com/seg3.ts');
+    // Only the CF-observed IP may be emitted; a client-supplied XFF is dropped.
+    fetchMock
+      .get('https://fwdip.example.com')
+      .intercept({
+        path: '/seg3.ts',
+        headers: (h) => h['x-forwarded-for'] === '203.0.113.9',
+      })
+      .reply(200, 'TSDATA', { headers: { 'Content-Type': 'video/mp2t' } });
+    const res = await handleSegment(
+      new Request(`${BASE}/seg/${token}.ts`, {
+        headers: { 'CF-Connecting-IP': '203.0.113.9', 'X-Forwarded-For': '1.2.3.4' },
+      }),
+      { ...env, FORWARD_CLIENT_IP: 'true' },
+      'req-fwd-spoof',
+      `${token}.ts`,
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it('does not forward conditional headers upstream (304 empty bodies would poison the cache)', async () => {
+    const token = await mintSegToken('https://fwdip.example.com/seg4.ts');
+    fetchMock
+      .get('https://fwdip.example.com')
+      .intercept({
+        path: '/seg4.ts',
+        headers: (h) => h['if-none-match'] === undefined && h['if-modified-since'] === undefined,
+      })
+      .reply(200, 'TSDATA', { headers: { 'Content-Type': 'video/mp2t' } });
+    const res = await handleSegment(
+      new Request(`${BASE}/seg/${token}.ts`, {
+        headers: { 'If-None-Match': '"abc"', 'If-Modified-Since': 'Wed, 01 Jan 2020 00:00:00 GMT' },
+      }),
+      env,
+      'req-no-conditional',
+      `${token}.ts`,
+    );
+    expect(res.status).toBe(200);
+  });
+});
+

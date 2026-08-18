@@ -68,7 +68,9 @@ GitHub M3U (playlists/tv.m3u)
 - **Token**: AES-256-GCM, chứa upstream URL + iat/exp và identity đã xác thực (`MAC`, `user_id`, `access_key_id`, `session_id` khi có), tamper-proof, tự hết hạn. Token con trong manifest kế thừa cùng identity; khi bật claim `ip`, token lấy từ IP khác bị chặn `403 TOKEN_BINDING_MISMATCH`. Mỗi lần tải manifest/EPG còn kiểm tra lại trạng thái user/key/session để revoke có hiệu lực trước khi chạm upstream. Upstream URL không xuất hiện trong playlist.
 - **SSRF guard**: chỉ http/https public; chặn localhost, private IP, link-local, metadata endpoints — kiểm tra cả từng hop redirect.
 - **Circuit breaker**: upstream fail → failure state TTL 30s trong Cloudflare Cache; trong TTL trả ngay fallback manifest, hết TTL tự retry.
+- **Fallback là playlist LIVE tạm, không phải "kênh chết"**: khi upstream hiccup, CHRTV trả playlist live rỗng (không `#EXT-X-ENDLIST`). VLC/TiviMate/hls.js sẽ tiếp tục hỏi lại và kênh TỰ phục hồi khi upstream sống lại — thay vì player kết luận "stream đã kết thúc" rồi văng ra, bắt bạn mở lại kênh sau mỗi lần giật 1 giây.
 - **Channel health sweep**: cron `*/10 * * * *` chủ động probe batch kênh nhỏ (ưu tiên chưa check), đánh dấu `channel_health` online/offline/unknown → lộ ra qua `/api/admin/offline` + `health_status` ở `/api/admin/channels`. `offline` **chỉ khi link thật sự không vô được** (host không tới được, **im lặng quá 30s**, 404/410) và phải fail như vậy **2 lượt probe liên tiếp** mới chốt. Mọi trường hợp server vẫn trả lời — 5xx, 401/403/429/451 (auth/geo-block/rate-limit), 200 + body không phải HLS (trang anti-bot), port Worker không fetch được — đều là `unknown`, không bao giờ gán offline sai.
+  Link cá nhân có credential trong query (`?token=…`, `?sign=…`, portal/MAC) **không bị probe**: sweep từ colo Cloudflare ngẫu nhiên trông y hệt chia sẻ tài khoản với hệ anti-abuse của relay/portal và có thể khiến link bị throttle/ban. Các kênh này giữ `unknown` với mã `PERSONAL_LINK` (bật lại bằng `HEALTH_PROBE_CREDENTIAL_LINKS=true`).
 - **Playlist sync an toàn**: playlist mới lỗi → giữ nguyên version cũ, đánh dấu sync failed. Hash không đổi → không ghi lại DB.
 - **Session login an toàn**: `POST /api/login` đổi username/password thành URL
   `/p/{opaque-token}.m3u` không chứa password. Server chỉ lưu HMAC của token;
@@ -414,12 +416,22 @@ không-disclosure áp dụng cho curl, player và trình duyệt.
   publish, và token segment là deterministic nên cùng một segment luôn ra cùng
   một URL. Chỉ request ĐẦU TIÊN phải chịu TTFB 10-25s của relay chậm; player
   retry / viewer thứ hai / nhánh ABR lấy lại segment đó nhận ngay từ cache —
-  giảm hẳn cảnh "load video quá lâu" khi nhiều người cùng xem. Manifest không
-  cache (playlist live đổi liên tục), Range request đi thẳng upstream.
+  giảm hẳn cảnh "load video quá lâu" khi nhiều người cùng xem. Chỉ body 2xx
+  mới được cache (status-aware), nên một 4xx/5xx thoáng qua không bị phát lại
+  cho mọi viewer suốt TTL. Range request đi thẳng upstream.
 - **Retry 1 lần** cho lỗi tạm thời fail nhanh (mạng / 5xx) trước khi mở circuit
   breaker — nhưng chỉ với phần thời gian còn lại của ngân sách 30s. Timeout đã
   là kết luận đủ chắc nên **không retry** (tránh kéo dài 60s trước khi player
   nhận được fallback).
+- **`FORWARD_CLIENT_IP=true` cho relay tự host**: relay kiểu MAC-portal/playnow
+  authorize/geo-fence/rate-limit theo client IP; nếu không bật, chúng chỉ thấy IP
+  datacenter Cloudflare (đổi theo colo) — VLC mở trực tiếp từ nhà thì được, còn
+  đúng link đó đi qua proxy lại ăn 403 / trang "Upstream HTTP 403". Khi bật, IP
+  thật của viewer được gắn vào `X-Forwarded-For`/`X-Real-IP` để relay áp rule lên
+  đúng người xem. Nếu server của *seller* chặn hẳn IP datacenter (kiểm tra
+  `/admin` → failures: `UPSTREAM_UNREACHABLE`/`UPSTREAM_TIMEOUT` trong khi VLC ở
+  nhà vẫn xem ngon), code worker không vượt được — hãy cho relay của bạn proxy
+  bytes thay vì 302-redirect về origin IP:port.
 - **SEGMENT_TTL 60 phút** (trước là 15) → token không hết hạn giữa chừng khi đang xem.
 - **Không forward `accept-encoding`**, ép `identity` → body không bị giải nén lệch
   `Content-Length` làm player thấy segment cụt.

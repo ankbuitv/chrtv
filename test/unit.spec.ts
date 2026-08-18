@@ -6,6 +6,7 @@ import { createToken, parseTokenBindingPolicy, requestTokenBinding, verifyToken 
 import { parsePlaylist, PlaylistError } from '../src/playlist/parser';
 import { rewriteManifest, looksLikeHls, HlsError } from '../src/hls/rewrite';
 import { buildErrorManifest } from '../src/hls/errorManifest';
+import { isCredentialBearingUrl } from '../src/playlist/health';
 import { hashPassword, hashAccessKey, timingSafeEqual, randomHex } from '../src/utils/crypto';
 import { isHoneypotPath, shouldBanHoneypotRequest } from '../src/security/honeypot';
 import { parsePrivateLogin } from '../src/auth/privateLogin';
@@ -367,13 +368,21 @@ describe('HLS rewriting', () => {
 });
 
 describe('error manifest', () => {
-  it('is valid ended HLS with no leaks', () => {
+  it('is valid LIVE HLS (no ENDLIST => players keep retrying) with no leaks', () => {
     const m = buildErrorManifest();
     expect(m.startsWith('#EXTM3U')).toBe(true);
-    expect(m).toContain('#EXT-X-ENDLIST');
+    // Deliberately no ENDLIST: an ended playlist makes VLC & co declare the
+    // channel "over" after a single upstream hiccup; a live empty playlist
+    // keeps them polling until the upstream recovers.
+    expect(m).not.toContain('#EXT-X-ENDLIST');
     expect(m).toContain('#EXT-X-TARGETDURATION');
     expect(m).not.toContain('http');
     expect(m).not.toContain('<');
+  });
+  it('embeds only the stable reason code', () => {
+    const m = buildErrorManifest('UPSTREAM_4XX');
+    expect(m).toContain('UPSTREAM_4XX');
+    expect(m).not.toContain('#EXT-X-ENDLIST');
   });
 });
 
@@ -453,3 +462,21 @@ describe('web player paste-and-play availability', () => {
     expect(urlPlayEnabled(envOf({ ALLOW_URL_PLAY: 'false' }))).toBe(false);
   });
 });
+
+describe('credential-bearing URL detection (health sweep skip)', () => {
+  it('flags token/sign/auth-style query params as personal credentials', () => {
+    expect(isCredentialBearingUrl('https://relay.example.com/x/index.m3u8?token=abc123')).toBe(true);
+    expect(isCredentialBearingUrl('https://cdn.example.com/live/vtv1.m3u8?sign=1784795514-MA-0-xx')).toBe(true);
+    expect(isCredentialBearingUrl('https://cdn.example.com/s.m3u8?hdnts=exp=1~acl=*')).toBe(true);
+    expect(isCredentialBearingUrl('https://p.example.com/a.m3u8?TOKEN=ABC')).toBe(true);
+  });
+  it('does not flag plain or xtream-style URLs', () => {
+    expect(isCredentialBearingUrl('https://up.example.com/live/vtv1/index.m3u8')).toBe(false);
+    expect(isCredentialBearingUrl('http://portal.example.com:8080/live/user/pass/12345.m3u8')).toBe(false);
+    expect(isCredentialBearingUrl('https://up.example.com/x.m3u8?quality=hd')).toBe(false);
+  });
+  it('never throws on malformed input', () => {
+    expect(isCredentialBearingUrl('not a url')).toBe(false);
+  });
+});
+

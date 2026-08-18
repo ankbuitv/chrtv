@@ -41,6 +41,14 @@ import { logEvent } from '../utils/http';
  * so the sweep keeps a per-channel `fail_streak`: the first unreachable result
  * records `unknown` (streak 1), and only a second consecutive one flips the
  * channel to `offline`. Any success or inconclusive probe resets the streak.
+ *
+ * Credential-bearing personal links (`?token=…`, `?sign=…`, MAC/portal-style
+ * query credentials) are NEVER probed: cron sweeps run on arbitrary Cloudflare
+ * colos worldwide, and anti-abuse systems on relays/portals read "same
+ * credential, many datacenter IPs" as account sharing — the sweep itself
+ * would get the viewer's link throttled or banned. Those channels are
+ * recorded as `unknown` with code PERSONAL_LINK each rotation. Set
+ * HEALTH_PROBE_CREDENTIAL_LINKS=true to force probing anyway.
  */
 
 export type HealthStatus = 'online' | 'offline' | 'unknown';
@@ -149,6 +157,47 @@ async function readPrefix(res: Response, max: number): Promise<string> {
   } catch {
     return '';
   }
+}
+
+/**
+ * Query-parameter names that mark a credential-bearing personal link
+ * (`?token=`, `?sign=`, portal/MAC credentials, expiring signatures…).
+ * Presence of any of them means the URL is a personal, possibly
+ * single-viewer ticket — never ping it from a random sweep colo.
+ */
+const CREDENTIAL_QUERY_KEYS = new Set([
+  'token',
+  'sign',
+  'signature',
+  'auth',
+  'auth_token',
+  'wmsauthsign',
+  'hdnts',
+  'expires',
+  'expire',
+  'key',
+  'session',
+  'sid',
+  'uid',
+  'mac',
+]);
+
+/** True when the URL carries credential-like query params (personal link). */
+export function isCredentialBearingUrl(raw: string): boolean {
+  try {
+    const url = new URL(raw);
+    for (const key of url.searchParams.keys()) {
+      if (CREDENTIAL_QUERY_KEYS.has(key.toLowerCase())) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether the sweep may probe credential-bearing links (default: no). */
+export function credentialProbeEnabled(env: Env): boolean {
+  return (env.HEALTH_PROBE_CREDENTIAL_LINKS ?? '').trim().toLowerCase() === 'true';
 }
 
 /**
@@ -293,20 +342,12 @@ export async function healthCheckBatch(env: Env, limit: number): Promise<HealthC
     .all<{ id: string; url: string; fail_streak: number }>();
 
   const now = Math.floor(Date.now() / 1000);
-  const probed = await mapWithConcurrency(results, PROBE_CONCURRENCY, async (ch) => {
-    const raw = await probeChannel(ch.url);
-    // Confirmation gate: a channel only goes `offline` after
-    // OFFLINE_CONFIRMATIONS consecutive unreachable probes. The first failed
-    // probe is persisted as `unknown` (with the error code kept for the
-    // admin) so one bad network moment never flags a watchable channel.
-    const streak = raw.status === 'offline' ? (ch.fail_streak ?? 0) + 1 : 0;
-    const status: HealthStatus = raw.status === 'offline' && streak < OFFLINE_CONFIRMATIONS ? 'unknown' : raw.status;
-    const r = { id: ch.id, status, errorCode: raw.errorCode, httpStatus: raw.httpStatus, streak };
-    // Persist each result the moment it lands instead of one batch write at
-    // the end: with a 30s probe timeout, a sweep full of dead upstreams can
-    // brush against the cron wall-clock limit, and a final write would lose
-    // every finished probe — leaving the same slow channels "oldest checked"
-    // forever, hogging every future sweep.
+  // Persist each result the moment it lands instead of one batch write at
+  // the end: with a 30s probe timeout, a sweep full of dead upstreams can
+  // brush against the cron wall-clock limit, and a final write would lose
+  // every finished probe — leaving the same slow channels "oldest checked"
+  // forever, hogging every future sweep.
+  const persist = async (r: { id: string; status: HealthStatus; errorCode: string; httpStatus: number; streak: number }) => {
     try {
       await env.DB
         .prepare(
@@ -324,6 +365,28 @@ export async function healthCheckBatch(env: Env, limit: number): Promise<HealthC
     } catch {
       /* health persistence must never break the sweep — next rotation retries */
     }
+  };
+  const probeCredentials = credentialProbeEnabled(env);
+  const probed = await mapWithConcurrency(results, PROBE_CONCURRENCY, async (ch) => {
+    // Personal credential-bearing links are never probed (see module docs):
+    // a sweep colo pinging a `?token=`/`?sign=` link looks exactly like
+    // account sharing to the relay's anti-abuse, and can throttle or ban the
+    // viewer's link. Marking `unknown` still refreshes checked_at, so the
+    // rotation does not keep selecting the same unprobeable channels.
+    if (!probeCredentials && isCredentialBearingUrl(ch.url)) {
+      const r = { id: ch.id, status: 'unknown' as HealthStatus, errorCode: 'PERSONAL_LINK', httpStatus: 0, streak: 0 };
+      await persist(r);
+      return r;
+    }
+    const raw = await probeChannel(ch.url);
+    // Confirmation gate: a channel only goes `offline` after
+    // OFFLINE_CONFIRMATIONS consecutive unreachable probes. The first failed
+    // probe is persisted as `unknown` (with the error code kept for the
+    // admin) so one bad network moment never flags a watchable channel.
+    const streak = raw.status === 'offline' ? (ch.fail_streak ?? 0) + 1 : 0;
+    const status: HealthStatus = raw.status === 'offline' && streak < OFFLINE_CONFIRMATIONS ? 'unknown' : raw.status;
+    const r = { id: ch.id, status, errorCode: raw.errorCode, httpStatus: raw.httpStatus, streak };
+    await persist(r);
     return r;
   });
 
