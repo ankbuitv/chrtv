@@ -9,5 +9,6 @@ declare module 'cloudflare:test' {
     PUBLIC_PLAYLIST: string;
     TOKEN_BINDING: string;
     FALLBACK_M3U_URL: string;
+    REDIRECT_UNSUPPORTED_PORTS: string;
   }
 }

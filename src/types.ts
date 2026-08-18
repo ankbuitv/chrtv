@@ -14,11 +14,20 @@ export interface Env {
   /** Honeypot/brute-force ban duration in seconds (default: 86400, max: 604800). */
   HONEYPOT_BAN_SECONDS?: string;
   /**
+   * "true" (default): an upstream on a port Workers cannot fetch (e.g. DuckDNS
+   * on :30113) is served to the player as a 302 redirect to the origin instead
+   * of being skipped — players are ordinary clients and can open any port.
+   * "false": strict origin hiding — such channels fall back / fail closed and
+   * the origin is never disclosed.
+   */
+  REDIRECT_UNSUPPORTED_PORTS?: string;
+  /**
    * Optional fallback HLS playlist served when a channel upstream is dead.
    * Comma-separated list allowed; candidates are tried in order. Only URLs on
    * Workers-fetchable ports are re-proxied; unsupported-port candidates are
-   * skipped so their origins are never exposed in a client-facing redirect.
-   * Empty/no usable candidate => the empty "signal lost" manifest is served.
+   * redirected to their origin when REDIRECT_UNSUPPORTED_PORTS is enabled,
+   * otherwise skipped so their origins are never exposed. Empty/no usable
+   * candidate => the empty "signal lost" manifest is served.
    */
   FALLBACK_M3U_URL?: string;
   /** Secret used for token encryption + credential hashing. Set via wrangler secret. */

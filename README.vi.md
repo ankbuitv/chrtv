@@ -333,13 +333,20 @@ Cấu hình trong `wrangler.toml`:
   scanner trap. Ban đã tồn tại và brute-force protection vẫn tiếp tục áp dụng.
 - `HONEYPOT_BAN_SECONDS` — thời gian ban honeypot/brute-force, mặc định `86400`
   (một ngày), tối thiểu 60 giây và clamp tối đa 7 ngày.
+- `REDIRECT_UNSUPPORTED_PORTS` — mặc định `"true"`: upstream nằm trên port Worker
+  **không** fetch được (ví dụ DuckDNS trên `:30113`) được trả cho player dưới dạng
+  **302 redirect thẳng tới origin** thay vì bị bỏ qua — player là client thường
+  nên mở được mọi port, kênh vẫn phát được dù Worker không proxy nổi. Đặt
+  `"false"` để bật strict origin hiding (kênh đó fallback / fail closed, không
+  bao giờ lộ origin).
 - `FALLBACK_M3U_URL` — (tuỳ chọn) playlist HLS phát thay khi kênh chết. Cho phép **nhiều URL,
   ngăn cách bằng dấu phẩy**, thử lần lượt:
   1. URL nằm trên port Worker fetch được → CHRTV fetch + re-proxy (segment thành `/seg/{token}`),
      không lộ URL fallback, chạy được cả trên trang https.
-  2. URL nằm trên port Worker **không** fetch được (ví dụ `:30113`) → bỏ qua, tuyệt đối không
-     redirect client tới origin thô.
-  3. Không có URL proxy được → manifest "signal lost" rỗng mặc định.
+  2. URL nằm trên port Worker **không** fetch được (ví dụ `:30113`) → với
+     `REDIRECT_UNSUPPORTED_PORTS=true` trả 302 redirect tới origin của candidate;
+     với `"false"` thì bỏ qua, tuyệt đối không redirect client tới origin thô.
+  3. Không có URL dùng được → manifest "signal lost" rỗng mặc định.
 - `HEALTH_CHECK_BATCH` — (tuỳ chọn) số kênh probe mỗi cron health sweep (`*/10 * * * *`).
   Luôn bị clamp về hard cap 12 (subrequest budget gói Free — xem phần Channel health),
   đặt lớn hơn cũng không quét nhanh hơn mà còn gây gán offline oan.
@@ -354,21 +361,29 @@ hoặc treo tới hết timeout → player báo **"connection is unstable"**:
 | `http:`  | 80, 8080, 8880, 2052, 2082, 2086, 2095 |
 | `https:` | 443, 8443, 2053, 2083, 2087, 2096 |
 
-CHRTV kiểm tra trước khi fetch và áp dụng **strict origin hiding**:
+CHRTV kiểm tra trước khi fetch. Với `REDIRECT_UNSUPPORTED_PORTS=true` (mặc định),
+nguồn trên port không fetch được vẫn phát nhờ **302 redirect thẳng tới origin** —
+player là client thường nên mở được mọi port và xem trực tiếp từ nguồn:
 
-- URL kênh trong playlist dùng port không hợp lệ → playlist vẫn chỉ chứa
-  `/hls/{token}`. Sau khi xác thực token + identity binding, Worker thử fallback
-  proxy được; nếu không có thì trả manifest "signal lost" hợp lệ. Response không
-  bao giờ chứa origin thô hoặc `Location` trỏ tới origin đó.
-- URI con trong manifest dùng port không hợp lệ → từ chối cả manifest trước khi
-  phát capability con, rồi failover/fail closed; không tạo URL con không dùng được.
-- `FALLBACK_M3U_URL` dùng port không hợp lệ (ví dụ `:30113`) → bỏ qua candidate,
-  không redirect player và không lộ URL trong response.
+- URL kênh dùng port không hợp lệ → playlist vẫn chỉ chứa `/hls/{token}` (opaque).
+  Sau khi xác thực token + identity binding, Worker trả `302 Location: <origin>`
+  và player tự kết nối thẳng tới nguồn. Không fetch fallback, không manifest chết.
+- URI con trong manifest đã fetch được mà nằm trên port không hợp lệ → giữ nguyên
+  URL origin thô trong manifest đã rewrite (chỉ URI đó đi thẳng; các URI fetch
+  được khác vẫn được tokenize `/hls/` + `/seg/` bình thường).
+- `FALLBACK_M3U_URL` dùng port không hợp lệ (ví dụ `:30113`) → trả 302 redirect
+  tới origin của candidate đó.
 
-Nguồn custom-port muốn tiếp tục phát phải được đặt sau **HTTPS port 443**, đưa qua
-**Cloudflare Tunnel**, hoặc qua một **relay riêng** trên port Worker fetch được.
-CHRTV không dùng User-Agent/camouflage để chỉ che origin với scanner: cùng một luật
-không-disclosure áp dụng cho curl, player và trình duyệt.
+Với `REDIRECT_UNSUPPORTED_PORTS=false`, áp dụng **strict origin hiding**:
+kênh port không hợp lệ failover về fallback proxy được / manifest "signal lost";
+URI con port không hợp lệ từ chối cả manifest; candidate fallback port không hợp
+lệ bị bỏ qua — origin không bao giờ xuất hiện trong bất kỳ response nào.
+
+Lưu ý: stream bị redirect sẽ đi thẳng từ player tới origin — CHRTV không rewrite
+được URI con, không cache segment, và không che origin đó khỏi người xem kênh đó.
+Muốn phát qua proxy trọn vẹn, nguồn custom-port vẫn nên được đặt sau
+**HTTPS port 443**, đưa qua **Cloudflare Tunnel**, hoặc qua một **relay riêng**
+trên port Worker fetch được.
 
 ### Chống "connection is unstable"
 

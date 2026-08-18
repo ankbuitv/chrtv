@@ -16,8 +16,10 @@ function escapeName(v: string): string {
 /**
  * Generate the user-facing M3U. Every channel entry points to
  * {origin}/hls/{token}.m3u8, so raw upstream URLs never appear in the playlist.
- * A channel on a port the Worker cannot fetch remains opaque but fails closed
- * to a proxyable fallback/error manifest; CHRTV never redirects to its origin.
+ * A channel on a port the Worker cannot fetch is still included (opaque): with
+ * REDIRECT_UNSUPPORTED_PORTS enabled its /hls request 302s the player straight
+ * to the origin, otherwise it fails closed to a proxyable fallback/error
+ * manifest.
  */
 export async function buildPlaylist(
   env: Env,

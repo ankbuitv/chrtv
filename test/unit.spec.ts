@@ -439,4 +439,32 @@ describe('token stability (anti re-buffering)', () => {
     const custom = '#EXTM3U\n#EXTINF:6.0,\nhttp://origin.example.com:30113/seg.ts\n#EXT-X-ENDLIST\n';
     await expect(rewriteManifest(custom, opts)).rejects.toThrow('unsupported manifest URI port');
   });
+
+  it('emits raw origin URLs for custom-port URIs when allowDirectOrigin is set', async () => {
+    const custom = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg.ts\n#EXT-X-ENDLIST\n';
+    const direct = await rewriteManifest(custom, {
+      secret: SECRET,
+      baseUrl: 'http://origin.example.com:30113/live/index.m3u8',
+      publicOrigin: 'https://chrtv.example.com',
+      allowDirectOrigin: true,
+    });
+    // The segment URI resolves against the custom-port base and stays raw — no
+    // CHRTV /seg/ token is minted for a URL the Worker can never proxy.
+    expect(direct).toContain('http://origin.example.com:30113/live/seg.ts');
+    expect(direct).not.toContain('chrtv.example.com');
+    expect(direct).not.toContain('/seg/');
+  });
+
+  it('keeps fetchable descendants tokenized while only custom-port URIs stay raw', async () => {
+    const mixed =
+      '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg.ts\nhttp://other.example.com:30113/remote.ts\n#EXT-X-ENDLIST\n';
+    const out = await rewriteManifest(mixed, {
+      secret: SECRET,
+      baseUrl: 'https://cdn.example.com/live/index.m3u8',
+      publicOrigin: 'https://chrtv.example.com',
+      allowDirectOrigin: true,
+    });
+    expect(out).toContain('https://chrtv.example.com/seg/');
+    expect(out).toContain('http://other.example.com:30113/remote.ts');
+  });
 });

@@ -18,7 +18,10 @@ import { isFetchablePort } from '../utils/ports';
  *   media/keys/maps -> /seg/{token}[.ext]
  * Any resolved URL that cannot be safely proxied rejects the manifest rather
  * than leaking a direct URI. URLs on ports Cloudflare Workers cannot fetch are
- * rejected too: redirecting the player would expose the raw origin.
+ * rejected too — unless `allowDirectOrigin` is set, in which case they are left
+ * as direct origin URLs so the player (an ordinary client, able to open any
+ * port) can fetch them itself while the Worker keeps proxying the fetchable
+ * parts of a mixed-port manifest.
  */
 
 const MAX_MANIFEST_BYTES = 2 * 1024 * 1024;
@@ -74,6 +77,14 @@ export interface RewriteOptions {
   publicOrigin: string;
   /** Identity inherited from the parent token. */
   binding?: TokenBinding;
+  /**
+   * When true, URIs on ports the Worker cannot fetch are emitted as direct
+   * origin URLs instead of rejecting the manifest. Players can open any port,
+   * so mixed-port manifests keep playing while the fetchable URIs stay proxied
+   * through CHRTV. When false/absent, such URIs reject the whole manifest
+   * (fail closed, strict origin hiding).
+   */
+  allowDirectOrigin?: boolean;
   /** Channel id inherited for circuit-breaker/failure attribution. */
   channelId?: string;
   /** Parent capability boundary; descendants must never outlive it. */
@@ -83,7 +94,13 @@ export interface RewriteOptions {
 
 async function tokenUrl(opts: RewriteOptions, upstream: string, kind: 'm' | 's'): Promise<string> {
   if (!isSafeUpstreamUrl(upstream)) throw new HlsError('unsafe manifest URI');
-  if (!isFetchablePort(upstream)) throw new HlsError('unsupported manifest URI port');
+  if (!isFetchablePort(upstream)) {
+    // The Worker can never proxy this URI. With allowDirectOrigin the raw URL
+    // is left in place so the player fetches it directly; otherwise the whole
+    // manifest is rejected before any dead child capability is issued.
+    if (opts.allowDirectOrigin) return upstream;
+    throw new HlsError('unsupported manifest URI port');
+  }
   const now = opts.now ?? Math.floor(Date.now() / 1000);
   const ttl = kind === 'm' ? DEFAULT_MANIFEST_TTL : SEGMENT_TTL;
   // Quantized issue time + deterministic IV => the same upstream URI keeps the

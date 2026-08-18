@@ -45,6 +45,13 @@ TOKEN_BINDING = "mac,user,key"
 # Separate auth_events intentionally retain raw client IP for 30 days.
 HONEYPOT_ENABLED = "true"
 HONEYPOT_BAN_SECONDS = "86400"
+# "true" (default): an upstream on a port Workers cannot fetch (e.g. DuckDNS
+# on :30113) is served to the player as a 302 redirect to the origin instead
+# of being skipped — players are ordinary clients and CAN open any port, so
+# the channel keeps playing even though the Worker cannot proxy it.
+# "false": strict origin hiding — such channels fall back / fail closed and
+# the origin is never disclosed.
+REDIRECT_UNSUPPORTED_PORTS = "true"
 # Fallback playlist served when a channel upstream is dead.
 # Accepts a comma-separated list; candidates are tried in order.
 # Empty => serve the built-in empty "signal lost" manifest instead.
@@ -52,11 +59,11 @@ HONEYPOT_BAN_SECONDS = "86400"
 # NOTE: Cloudflare Workers can only open subrequests on these ports —
 #   http:  80, 8080, 8880, 2052, 2082, 2086, 2095
 #   https: 443, 8443, 2053, 2083, 2087, 2096
-# Port 30113 is NOT in that list, so the Worker can never fetch it. Strict
-# origin hiding skips unsupported-port candidates instead of redirecting the
-# player and exposing the raw URL. Put custom-port sources behind HTTPS :443,
-# Cloudflare Tunnel, or a dedicated relay on a fetchable port before listing
-# them here. Empty => use the built-in safe "signal lost" manifest.
+# Port 30113 is NOT in that list, so the Worker can never fetch it. With
+# REDIRECT_UNSUPPORTED_PORTS=true an unsupported-port candidate is served as a
+# 302 redirect to its origin; with "false" it is skipped (strict origin
+# hiding). Put custom-port sources behind HTTPS :443, Cloudflare Tunnel, or a
+# dedicated relay on a fetchable port to keep them fully proxied.
 FALLBACK_M3U_URL = ""
 ADMIN_TOKEN = "Q8vLm3Xz7Np2Ka9Rt5Yw4Hs6Bc1Df0Gj"
 SECRET_KEY = "7fK9mQ2xLp8VnR4cYt6Wz3AaHj5Ns0Bd"

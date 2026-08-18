@@ -38,10 +38,37 @@ async function failureKey(payload: { c?: string; u: string }): Promise<string> {
 }
 
 /**
+ * REDIRECT_UNSUPPORTED_PORTS ("true" default): an upstream on a port Workers
+ * cannot open a subrequest to (e.g. a DuckDNS source on :30113) is served to
+ * the player as a direct 302 redirect to the origin instead of being skipped.
+ * Players are ordinary clients and CAN open any port, so the channel keeps
+ * playing even though the Worker can't proxy it. "false" restores strict
+ * origin hiding: such channels fall back / fail closed and the origin is
+ * never disclosed.
+ */
+function redirectUnsupportedPorts(env: Env): boolean {
+  return (env.REDIRECT_UNSUPPORTED_PORTS ?? 'true').toLowerCase() !== 'false';
+}
+
+/** 302 to the raw origin, used for streams the Worker cannot proxy itself. */
+function redirectResponse(location: string, requestId: string): Response {
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: location,
+      'Cache-Control': 'no-store',
+      'Access-Control-Allow-Origin': '*',
+      'X-Request-ID': requestId,
+    },
+  });
+}
+
+/**
  * Fallback playlist candidates.
  * FALLBACK_M3U_URL may list several URLs (comma / whitespace separated); they
  * are tried in order. Only URLs the Worker can fetch are ever sent upstream;
- * an unsupported-port origin is never disclosed to the client.
+ * an unsupported-port origin is never disclosed to the client unless
+ * REDIRECT_UNSUPPORTED_PORTS is enabled.
  */
 export function fallbackCandidates(env: Env): string[] {
   return (env.FALLBACK_M3U_URL ?? '')
@@ -54,9 +81,11 @@ export function fallbackCandidates(env: Env): string[] {
 /**
  * Serve the fallback playlist when a channel upstream is dead.
  * Fetchable candidates are fetched and fully rewritten so every media URL stays
- * on CHRTV. Unsupported-port candidates are skipped rather than redirected:
- * returning their raw Location would reveal the origin to curl, players, and
- * scanners. If no candidate can be proxied, return the safe empty HLS manifest.
+ * on CHRTV. When REDIRECT_UNSUPPORTED_PORTS is enabled an unsupported-port
+ * candidate is served as a direct 302 redirect to its origin (the player can
+ * open any port); otherwise it is skipped rather than redirected, so its raw
+ * origin is never disclosed. If no candidate can be used, return the safe
+ * empty HLS manifest.
  */
 async function serveFallbackManifest(
   env: Env,
@@ -72,6 +101,10 @@ async function serveFallbackManifest(
 
   for (const fallbackUrl of candidates) {
     if (!isFetchablePort(fallbackUrl)) {
+      if (redirectUnsupportedPorts(env)) {
+        logEvent(requestId, '/hls', 'FALLBACK_UNSUPPORTED_PORT_REDIRECT', 'direct origin');
+        return redirectResponse(fallbackUrl, requestId);
+      }
       logEvent(requestId, '/hls', 'FALLBACK_UNSUPPORTED_PORT', 'origin hidden');
       continue;
     }
@@ -101,6 +134,7 @@ async function serveFallbackManifest(
         baseUrl: upstream.finalUrl,
         publicOrigin: new URL(req.url).origin,
         binding,
+        allowDirectOrigin: redirectUnsupportedPorts(env),
         ...(channelId ? { channelId } : {}),
         ...(absoluteExpiry !== undefined ? { absoluteExpiry } : {}),
       });
@@ -152,10 +186,16 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
   }
   const binding = tokenBindingFromPayload(payload);
 
-  // Never disclose an unsupported-port origin in a client-facing redirect.
-  // Such channels must be moved behind an HTTPS relay/Tunnel on a fetchable
-  // port; until then, use only a proxyable fallback or the safe error manifest.
+  // An upstream on a port Workers cannot fetch can never be proxied here.
+  // With REDIRECT_UNSUPPORTED_PORTS enabled the player is sent straight to
+  // the origin (ordinary clients can open any port); otherwise the channel
+  // fails over to a proxyable fallback / the safe error manifest and the
+  // origin is never disclosed in a client-facing redirect.
   if (!isFetchablePort(payload.u)) {
+    if (redirectUnsupportedPorts(env)) {
+      logEvent(requestId, '/hls', ErrorCodes.UNSUPPORTED_PORT, 'redirecting to origin');
+      return redirectResponse(payload.u, requestId);
+    }
     logEvent(requestId, '/hls', ErrorCodes.UNSUPPORTED_PORT, 'origin hidden');
     if (payload.c) await recordFailure(env.DB, payload.c, ErrorCodes.UNSUPPORTED_PORT, 0);
     return serveFallbackManifest(env, req, requestId, binding, payload.c, payload.exp, ErrorCodes.UNSUPPORTED_PORT);
@@ -200,6 +240,7 @@ export async function handleHlsManifest(req: Request, env: Env, requestId: strin
       baseUrl: upstream.finalUrl, // relative URIs resolve against the FINAL (post-redirect) URL
       publicOrigin: new URL(req.url).origin,
       binding,
+      allowDirectOrigin: redirectUnsupportedPorts(env),
       ...(payload.c ? { channelId: payload.c } : {}),
       absoluteExpiry: payload.exp,
     });
@@ -241,6 +282,10 @@ export async function handleSegment(req: Request, env: Env, requestId: string, r
   }
 
   if (!isFetchablePort(verdict.payload.u)) {
+    if (redirectUnsupportedPorts(env)) {
+      logEvent(requestId, '/seg', ErrorCodes.UNSUPPORTED_PORT, 'redirecting to origin');
+      return redirectResponse(verdict.payload.u, requestId);
+    }
     logEvent(requestId, '/seg', ErrorCodes.UNSUPPORTED_PORT, 'origin hidden');
     return errorResponse(ErrorCodes.UNSUPPORTED_PORT, 502, requestId);
   }
