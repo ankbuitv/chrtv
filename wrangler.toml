@@ -63,6 +63,18 @@ HONEYPOT_BAN_SECONDS = "86400"
 # Cloudflare Tunnel, or a dedicated relay on a fetchable port before listing
 # them here. Empty => use the built-in safe "signal lost" manifest.
 FALLBACK_M3U_URL = ""
+# Health sweep: credential-bearing personal links (?token=…, ?sign=…) are NOT
+# probed by default — a cron probe from a random Cloudflare colo looks exactly
+# like account sharing to relay/portal anti-abuse and can throttle or ban your
+# link. Set "true" only if you understand that risk and want health info anyway.
+# HEALTH_PROBE_CREDENTIAL_LINKS = "true"
+# Operator-owned relays only: "true" attaches the real viewer IP (Cloudflare's
+# CF-Connecting-IP) as X-Forwarded-For / X-Real-IP on upstream fetches. Needed
+# when your relay (e.g. your own "playnow" box) authorizes / geo-fences /
+# rate-limits by client IP — otherwise it sees a varying Cloudflare datacenter
+# address (direct VLC works, proxy does not). Do not enable for untrusted
+# upstreams (privacy).
+# FORWARD_CLIENT_IP = "true"
 ADMIN_TOKEN = "Q8vLm3Xz7Np2Ka9Rt5Yw4Hs6Bc1Df0Gj"
 SECRET_KEY = "7fK9mQ2xLp8VnR4cYt6Wz3AaHj5Ns0Bd"
 

@@ -1,6 +1,8 @@
 import { isSafeUpstreamUrl } from '../utils/urlsafe';
 import { isFetchablePort } from '../utils/ports';
+import { getClientIp } from '../token';
 import { ErrorCodes, type ErrorCode } from '../errors/codes';
+import type { Env } from '../types';
 
 /**
  * Operator policy: an upstream is only declared dead after **30s of silence**.
@@ -37,12 +39,35 @@ const SEGMENT_TIMEOUT_MS = 30_000;
 const SEGMENT_CACHE_TTL_SECONDS = 30;
 
 /**
+ * Edge micro-cache TTL for manifest fetches (seconds).
+ * Manifests are the tune-in hot path: a player opening one channel costs
+ * 2 sequential upstream fetches (master/variant, then media playlist), and
+ * every live poll of the media playlist hits the upstream again. With a slow
+ * relay that makes channels painful to open and multiplies parallel
+ * connections against upstreams that limit or fingerprint per-token usage.
+ * A few seconds of edge caching dedupes simultaneous viewers and rapid
+ * player polling into ~1 upstream fetch per colo per TTL — dramatically
+ * fewer upstream connections, much faster zap-back to a recently-watched
+ * channel, while a ≤4s staleness stays well inside any sane live window.
+ * 2xx AND short-lived redirect responses are cached (relays often pay their
+ * entire latency budget on the 302 hop); error statuses are never cached.
+ */
+const MANIFEST_CACHE_TTL_SECONDS = 4;
+
+/**
  * Request headers forwarded to the upstream. Auth/cookies are never forwarded.
  * `accept-encoding` is deliberately NOT forwarded: the Workers runtime
  * transparently decodes compressed bodies, which then no longer match the
  * upstream `Content-Length` and makes players see truncated segments.
+ *
+ * `if-none-match` / `if-modified-since` are NOT forwarded on purpose: through
+ * a shared edge cache a conditional request is a footgun. A 304 answer has an
+ * EMPTY body — the proxy would treat it as an "ok" manifest, and with edge
+ * caching enabled the empty 304 could even be cached and re-served to every
+ * other viewer (players like VLC/hls.js don't send conditional headers for
+ * HLS anyway; manifest freshness comes from the tiny cache TTL above).
  */
-const FORWARD_REQUEST_HEADERS = ['range', 'accept', 'if-none-match', 'if-modified-since'];
+const FORWARD_REQUEST_HEADERS = ['range', 'accept'];
 
 /** Response headers preserved from the upstream (Content-Length handled separately). */
 const PRESERVE_RESPONSE_HEADERS = ['content-type', 'content-range', 'accept-ranges', 'etag', 'last-modified', 'date'];
@@ -81,12 +106,59 @@ function isRetryable(code: ErrorCode): boolean {
   return code === ErrorCodes.UPSTREAM_UNREACHABLE || code === ErrorCodes.UPSTREAM_5XX;
 }
 
+/**
+ * Edge-cache config for an upstream fetch.
+ * Only successful (2xx) bodies are ever cached — a transient 4xx/5xx must
+ * never be pinned to the edge for TTL seconds, or one hiccup would replay
+ * the same error to every viewer until the TTL expired (the segment cache
+ * previously used a blanket cacheTtl, which did exactly that).
+ * Manifests additionally cache the redirect responses themselves (3xx):
+ * relays put most of their latency on that hop, and caching it briefly is
+ * the difference between a 12s and a 0.1s tune-in when several requests to
+ * the same relay URL arrive together. Conditional requests are never sent
+ * (see FORWARD_REQUEST_HEADERS), so an empty-body 304 cannot be produced or
+ * poison a cache entry. Range requests are never cache-initiators.
+ */
+function upstreamCacheCf(kind: UpstreamKind, method: 'GET' | 'HEAD', headers: Headers): RequestInitCfProperties | undefined {
+  if (method !== 'GET' || headers.has('range')) return undefined;
+  if (kind === 'segment') {
+    return { cacheEverything: true, cacheTtlByStatus: { '200-299': SEGMENT_CACHE_TTL_SECONDS } };
+  }
+  return {
+    cacheEverything: true,
+    cacheTtlByStatus: {
+      '200-299': MANIFEST_CACHE_TTL_SECONDS,
+      '300-399': MANIFEST_CACHE_TTL_SECONDS,
+    },
+  };
+}
+
+/**
+ * Opt-in (`FORWARD_CLIENT_IP=true`): attach the Cloudflare-observed viewer IP
+ * as X-Forwarded-For / X-Real-IP on upstream fetches. Off by default because
+ * handing client IPs to arbitrary upstreams is a privacy smell — but some
+ * operator-owned relays (e.g. a "playnow"-style box in front of a MAC/portal
+ * account) authorize, geo-fence or rate-limit by the CLIENT ip they see.
+ * Without this they see a Cloudflare datacenter address (a different one per
+ * colo) and correctly conclude something odd is going on: direct VLC from
+ * home works, the exact same link through the proxy gets 403s. With the flag
+ * on, the relay can apply its per-viewer logic to the real viewer instead.
+ */
+function applyClientIpForward(headers: Headers, clientReq: Request, env?: Env): void {
+  if (!env || (env.FORWARD_CLIENT_IP ?? '').trim().toLowerCase() !== 'true') return;
+  const ip = getClientIp(clientReq);
+  if (!ip) return;
+  headers.set('X-Forwarded-For', ip);
+  headers.set('X-Real-IP', ip);
+}
+
 async function fetchOnce(
   url: string,
   clientReq: Request,
   method: 'GET' | 'HEAD',
   deadline: number,
   kind: UpstreamKind,
+  env?: Env,
 ): Promise<UpstreamResult> {
   const headers = new Headers();
   for (const h of FORWARD_REQUEST_HEADERS) {
@@ -95,15 +167,9 @@ async function fetchOnce(
   }
   headers.set('Accept-Encoding', 'identity');
   headers.set('User-Agent', clientReq.headers.get('user-agent') ?? 'CHRTV/1.0');
+  applyClientIpForward(headers, clientReq, env);
 
-  // Segments are edge-cached so repeat hits skip the slow upstream entirely.
-  // Manifests must stay uncached (live playlists change every few seconds),
-  // and Range requests are excluded so a partial response can never be cached
-  // under the full-object key.
-  const cacheSegments = kind === 'segment' && method === 'GET' && !headers.has('range');
-  const cf: RequestInitCfProperties | undefined = cacheSegments
-    ? { cacheEverything: true, cacheTtl: SEGMENT_CACHE_TTL_SECONDS }
-    : undefined;
+  const cf = upstreamCacheCf(kind, method, headers);
 
   let currentUrl = url;
   let currentMethod = method;
@@ -166,21 +232,24 @@ async function fetchOnce(
  *   whatever is LEFT of the shared 30s budget; a timeout is conclusive and is
  *   never retried
  * - never forwards client cookies/authorization headers upstream
+ * - edge-caches successful responses briefly (status-aware, errors excluded)
+ *   so concurrent viewers and rapid live polling share one upstream fetch
  */
 export async function fetchUpstream(
   url: string,
   clientReq: Request,
   method: 'GET' | 'HEAD' = 'GET',
   kind: UpstreamKind = 'manifest',
+  env?: Env,
 ): Promise<UpstreamResult> {
   const timeoutMs = kind === 'manifest' ? MANIFEST_TIMEOUT_MS : SEGMENT_TIMEOUT_MS;
   // One deadline for everything: redirects AND the retry share it, so total
   // player-facing wait can never exceed the policy timeout.
   const deadline = Date.now() + timeoutMs;
-  const first = await fetchOnce(url, clientReq, method, deadline, kind);
+  const first = await fetchOnce(url, clientReq, method, deadline, kind, env);
   if (first.ok || !isRetryable(first.code)) return first;
   if (deadline - Date.now() <= 0) return first;
-  return fetchOnce(url, clientReq, method, deadline, kind);
+  return fetchOnce(url, clientReq, method, deadline, kind, env);
 }
 
 /** Build a passthrough media response — the body is streamed, never buffered. */
