@@ -1096,6 +1096,41 @@ describe('HLS proxy', () => {
     expect(res.headers.get('X-CHRTV-Fallback')).toBeNull();
   });
 
+  it('proxies playnow-style .m3u8 endpoints as media when HLS context says they are segments', async () => {
+    const origin = fetchMock.get('https://playnow-context.example.com');
+    origin
+      .intercept({ path: '/api/index.m3u8?token=abc' })
+      .reply(
+        200,
+        '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\nhttps://playnow-context.example.com/api/index.m3u8?u=variant&token=abc\n',
+      );
+    origin
+      .intercept({ path: '/api/index.m3u8?u=variant&token=abc' })
+      .reply(
+        200,
+        '#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:4,\nhttps://playnow-context.example.com/api/index.m3u8?u=segment&token=abc\n',
+      );
+    const mediaBytes = new Uint8Array([0x47, 0x40, 0x00, 0x10, 0xaa, 0xbb]);
+    origin
+      .intercept({ path: '/api/index.m3u8?u=segment&token=abc' })
+      .reply(200, mediaBytes, { headers: { 'Content-Type': 'video/mp2t' } });
+
+    const token = await mintToken('https://playnow-context.example.com/api/index.m3u8?token=abc');
+    const masterRes = await SELF.fetch(`${BASE}/hls/${token}.m3u8`);
+    expect(masterRes.headers.get('X-CHRTV-Fallback')).toBeNull();
+    const childUrl = (await masterRes.text()).split('\n').find((line) => line.includes('/hls/'))!;
+
+    const mediaRes = await SELF.fetch(childUrl);
+    expect(mediaRes.headers.get('X-CHRTV-Fallback')).toBeNull();
+    const segmentUrl = (await mediaRes.text()).split('\n').find((line) => line.includes('/seg/'))!;
+    expect(segmentUrl).toMatch(/^https:\/\/chrtv\.example\.com\/seg\/.+\.m3u8$/);
+
+    const segmentRes = await SELF.fetch(segmentUrl);
+    expect(segmentRes.status).toBe(200);
+    expect(segmentRes.headers.get('Content-Type')).toBe('video/mp2t');
+    expect(new Uint8Array(await segmentRes.arrayBuffer())).toEqual(mediaBytes);
+  });
+
   it('fails closed when an upstream manifest contains an unsafe descendant URI', async () => {
     const manifest = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nhttp://169.254.169.254/latest/meta-data\n#EXT-X-ENDLIST\n';
     fetchMock.get('https://unsafe-child.example.com').intercept({ path: '/index.m3u8' }).reply(200, manifest);

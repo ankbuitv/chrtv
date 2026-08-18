@@ -69,11 +69,12 @@ GitHub M3U (playlists/tv.m3u)
 - **SSRF guard**: chỉ http/https public; chặn localhost, private IP, link-local, metadata endpoints — kiểm tra cả từng hop redirect.
 - **Circuit breaker**: upstream fail → failure state TTL 30s trong Cloudflare Cache; trong TTL trả ngay fallback manifest, hết TTL tự retry.
 - **Proxy lồng (PHP/portal → m3u8 khác)**: nhiều nguồn trả một M3U 1 dòng trỏ sang playlist thật, hoặc chỉ echo URL. CHRTV tự follow (tối đa 2 hop), rồi mới rewrite — player không bao giờ nhận wrapper để đem đi demux như MPEG-TS.
+- **Phân loại URI theo ngữ cảnh HLS, không đoán bằng đuôi file**: URI sau `#EXT-X-STREAM-INF` là manifest con; URI sau `#EXTINF` là media. Vì vậy relay kiểu PlayNow dùng cùng endpoint `index.m3u8?u=…` cho cả playlist lẫn segment vẫn được proxy đúng qua `/seg/`, không còn đem bytes MPEG-TS vào `/hls/` rồi load mãi.
 - **DASH/MPD + ClearKey**: `#KODIPROP:inputstream.adaptive.manifest_type=mpd` (và `license_key=kid:key`) được parse lúc sync. Playlist/`/xem` phát `/mpd/{token}.mpd`; Kodi/TiviMate nhận lại KODIPROP; web player dùng dash.js. Referer/UA/`X-Access-Token` từ `#EXTVLCOPT`/`#KODIPROP` được gắn lúc fetch, không lộ ra client.
 - **Fallback là playlist LIVE tạm, không phải "kênh chết"**: khi upstream hiccup, CHRTV trả playlist live rỗng (không `#EXT-X-ENDLIST`). VLC/TiviMate/hls.js sẽ tiếp tục hỏi lại và kênh TỰ phục hồi khi upstream sống lại — thay vì player kết luận "stream đã kết thúc" rồi văng ra, bắt bạn mở lại kênh sau mỗi lần giật 1 giây.
 - **Channel health sweep**: cron `*/10 * * * *` chủ động probe batch kênh nhỏ (ưu tiên chưa check), đánh dấu `channel_health` online/offline/unknown → lộ ra qua `/api/admin/offline` + `health_status` ở `/api/admin/channels`. `offline` **chỉ khi link thật sự không vô được** (host không tới được, **im lặng quá 30s**, 404/410) và phải fail như vậy **2 lượt probe liên tiếp** mới chốt. Mọi trường hợp server vẫn trả lời — 5xx, 401/403/429/451 (auth/geo-block/rate-limit), 200 + body không phải HLS (trang anti-bot), port Worker không fetch được — đều là `unknown`, không bao giờ gán offline sai.
   Link cá nhân có credential trong query (`?token=…`, `?sign=…`, portal/MAC) **không bị probe**: sweep từ colo Cloudflare ngẫu nhiên trông y hệt chia sẻ tài khoản với hệ anti-abuse của relay/portal và có thể khiến link bị throttle/ban. Các kênh này giữ `unknown` với mã `PERSONAL_LINK` (bật lại bằng `HEALTH_PROBE_CREDENTIAL_LINKS=true`).
-- **Playlist sync an toàn**: playlist mới lỗi → giữ nguyên version cũ, đánh dấu sync failed. Hash không đổi → không ghi lại DB.
+- **Playlist sync an toàn**: playlist mới lỗi → giữ nguyên version cũ, đánh dấu sync failed. Hash không đổi → không ghi lại DB. URL dùng cổng Cloudflare Worker không fetch được bị bỏ qua ngay lúc sync, nên `/tv.m3u` không phát link chắc chắn chỉ trả fallback/load mãi.
 - **Session login an toàn**: `POST /api/login` đổi username/password thành URL
   `/p/{opaque-token}.m3u` không chứa password. Server chỉ lưu HMAC của token;
   session sống tới `users.expires_at` hoặc khi user/session bị revoke, đồng thời
@@ -389,10 +390,10 @@ hoặc treo tới hết timeout → player báo **"connection is unstable"**:
 
 CHRTV kiểm tra trước khi fetch và áp dụng **strict origin hiding**:
 
-- URL kênh trong playlist dùng port không hợp lệ → playlist vẫn chỉ chứa
-  `/hls/{token}`. Sau khi xác thực token + identity binding, Worker thử fallback
-  proxy được; nếu không có thì trả manifest "signal lost" hợp lệ. Response không
-  bao giờ chứa origin thô hoặc `Location` trỏ tới origin đó.
+- URL kênh trong playlist dùng port không hợp lệ → bị bỏ qua ngay lúc sync và
+  không xuất hiện trong `/tv.m3u`. Với capability cũ hoặc channel được ghi trực
+  tiếp vào D1, Worker vẫn từ chối fetch, thử fallback proxy được và không bao giờ
+  chứa origin thô hay `Location` trỏ tới origin đó trong response.
 - URI con trong manifest dùng port không hợp lệ → từ chối cả manifest trước khi
   phát capability con, rồi failover/fail closed; không tạo URL con không dùng được.
 - `FALLBACK_M3U_URL` dùng port không hợp lệ (ví dụ `:30113`) → bỏ qua candidate,

@@ -79,6 +79,10 @@ GitHub M3U (playlists/tv.m3u)
 - **Circuit breaker**: upstream failure → 30s failure state in the Cloudflare
   cache; within the TTL the fallback manifest is served immediately, after the
   TTL it retries automatically.
+- **HLS context beats filename extensions**: a URI after `#EXT-X-STREAM-INF` is
+  a child manifest; a URI after `#EXTINF` is media. PlayNow-style relays can
+  therefore use the same `index.m3u8?u=…` endpoint for playlists and binary
+  segments without CHRTV feeding MPEG-TS bytes into `/hls/` and spinning forever.
 - **The fallback is a LIVE placeholder, not a dead end**: when an upstream
   hiccups, CHRTV serves a valid empty *live* playlist (no `#EXT-X-ENDLIST`).
   VLC/TiviMate/hls.js keep polling and the channel comes back on its own when
@@ -99,7 +103,9 @@ GitHub M3U (playlists/tv.m3u)
   anti-abuse and can get the link throttled or banned. They stay `unknown`
   with code `PERSONAL_LINK` (`HEALTH_PROBE_CREDENTIAL_LINKS=true` opts back in).
 - **Safe playlist sync**: a broken new playlist keeps the previous version and
-  marks the sync failed. Unchanged hash → no DB writes.
+  marks the sync failed. Unchanged hash → no DB writes. URLs on ports a Worker
+  cannot fetch are skipped during sync, so `/tv.m3u` does not advertise entries
+  that can only return a fallback/spinner.
 - **Safe session login**: `POST /api/login` exchanges username/password for a
   `/p/{opaque-token}.m3u` URL with no password in it. The server only stores an
   HMAC of the token; a session lives until `users.expires_at` or until the
@@ -434,10 +440,10 @@ silently rewritten to 80/443 or hangs until the timeout → players report
 
 CHRTV validates before fetching and applies **strict origin hiding**:
 
-- A channel URL on an invalid port still only appears in the playlist as
-  `/hls/{token}`. After token + identity binding checks, the worker tries a
-  proxyable fallback; without one it returns a valid "signal lost" manifest.
-  The response never contains the raw origin or a `Location` pointing at it.
+- A playlist channel URL on an invalid port is skipped during sync and does not
+  appear in `/tv.m3u`. For an old capability or a channel inserted directly in
+  D1, the worker still refuses the fetch, tries a proxyable fallback, and never
+  includes the raw origin or a `Location` pointing at it in the response.
 - A child URI on an invalid port rejects the whole manifest before issuing any
   child capability, then fails over / fails closed; no dead child URLs are ever
   produced.

@@ -243,12 +243,18 @@ https://cdn.example.com/nogroup.m3u8
     expect(res.channels).toHaveLength(3);
     expect(res.skipped).toBe(1);
   });
-  it('accepts channels on non-standard ports', async () => {
-    const customPort = `#EXTM3U\n#EXTINF:-1 tvg-id="custom",Custom Channel\nhttp://chrtv.duckdns.org:18483/stream/cg_hbofam/index.m3u8\n`;
-    const res = await parsePlaylist(customPort);
+  it('keeps supported Cloudflare ports and skips ports a Worker cannot fetch', async () => {
+    const customPorts = [
+      '#EXTM3U',
+      '#EXTINF:-1 tvg-id="supported",Supported Channel',
+      'http://relay.example.com:8080/live/index.m3u8',
+      '#EXTINF:-1 tvg-id="unsupported",Unsupported Channel',
+      'http://chrtv.duckdns.org:30114/stream/dsc',
+    ].join('\n');
+    const res = await parsePlaylist(customPorts);
     expect(res.channels).toHaveLength(1);
-    expect(res.channels[0]!.url).toBe('http://chrtv.duckdns.org:18483/stream/cg_hbofam/index.m3u8');
-    expect(res.skipped).toBe(0);
+    expect(res.channels[0]!.url).toBe('http://relay.example.com:8080/live/index.m3u8');
+    expect(res.skipped).toBe(1);
   });
 
   it('skips unsafe URLs', async () => {
@@ -312,6 +318,23 @@ describe('HLS rewriting', () => {
     const line = out.split('\n').find((l) => l.includes('/hls/'))!;
     expect(line).toContain('.m3u8');
     expect(await verifyProxied(line)).toBe('https://origin.example.com/live/abc/hd/index.m3u8?auth=1');
+  });
+  it('keeps EXTINF media on /seg even when a relay gives every resource a .m3u8 endpoint', async () => {
+    const manifest = [
+      '#EXTM3U',
+      '#EXT-X-TARGETDURATION:4',
+      '#EXT-X-KEY:METHOD=AES-128,URI="index.m3u8?u=key&token=abc"',
+      '#EXTINF:4,',
+      'index.m3u8?u=segment&token=abc',
+    ].join('\n');
+    const out = await rewriteManifest(manifest, opts);
+    expect(out).not.toContain('/hls/');
+    const keyUrl = out.match(/#EXT-X-KEY[^\n]*URI="([^"]+)"/)![1]!;
+    const segmentUrl = out.split('\n').find((line) => line.startsWith('https://chrtv.example.com/seg/'))!;
+    expect(keyUrl).toContain('/seg/');
+    expect(segmentUrl).toContain('/seg/');
+    expect(await verifyProxied(keyUrl)).toBe('https://origin.example.com/live/abc/index.m3u8?u=key&token=abc');
+    expect(await verifyProxied(segmentUrl)).toBe('https://origin.example.com/live/abc/index.m3u8?u=segment&token=abc');
   });
   it('rewrites EXT-X-KEY URIs', async () => {
     const manifest = '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="keys/k1.key",IV=0x1234\n#EXTINF:6.0,\ns.ts\n#EXT-X-ENDLIST\n';
