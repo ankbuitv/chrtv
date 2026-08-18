@@ -41,9 +41,21 @@ export function looksLikeHls(text: string): boolean {
 
 function resolveUri(uri: string, baseUrl: string): string | null {
   try {
-    // URL() handles absolute, protocol-relative (//host/x), relative paths,
-    // query strings and fragments.
-    return new URL(uri, baseUrl).toString();
+    const base = new URL(baseUrl);
+    const resolved = new URL(uri, baseUrl);
+    // Preserve base query params (e.g. ?token=...) for relative / same-origin
+    // segment URLs that don't specify their own query — required for tokenized
+    // upstream streams where the manifest URL carries the auth/session token.
+    if (
+      base.search &&
+      !resolved.search &&
+      resolved.origin === base.origin &&
+      !uri.trim().includes('?') &&
+      !uri.trim().includes('#')
+    ) {
+      resolved.search = base.search;
+    }
+    return resolved.toString();
   } catch {
     return null;
   }
