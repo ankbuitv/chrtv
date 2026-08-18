@@ -20,6 +20,10 @@ body{min-height:100vh;display:flex;align-items:center;justify-content:center;
 .ok{background:#34d399;box-shadow:0 0 8px #34d39988}
 .warn{background:#f59e0b;box-shadow:0 0 8px #f59e0b88}
 .foot{margin-top:36px;font-size:12px;color:#5b6778}
+.watch{display:inline-block;margin-top:26px;font-size:14px;padding:11px 26px;border-radius:12px;
+  text-decoration:none;letter-spacing:.04em;color:#06121f;font-weight:700;
+  background:linear-gradient(92deg,#7dd3fc,#818cf8);box-shadow:0 10px 34px rgba(129,140,248,.35)}
+.watch:hover{filter:brightness(1.08)}
 code{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);
   border-radius:8px;padding:3px 9px;font-size:13px;color:#9fd3ff}
 `;
@@ -39,6 +43,7 @@ export function landingPage(status: { syncStatus: string; channelCount: string; 
     <span class="pill"><span class="dot ${dotClass}"></span>${syncLabel}</span>
     <span class="pill">${status.channelCount || '0'} channels</span>
   </div>
+  <div><a class="watch" href="/xem">▶ Xem ngay trên web</a></div>
 </main></body></html>`;
   return new Response(html, {
     status: 200,

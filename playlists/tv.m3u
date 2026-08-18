@@ -7,6 +7,11 @@
 # Cập nhật ngày: 06/01
 # ==========================================
 
+# ---- Kênh cá nhân (link .m3u8 kèm ?token=…): token hết hạn thì thay link mới,
+# ---- sync 15 phút/lần (hoặc bấm Sync trong /admin) và xem ngay tại /xem ----
+#EXTINF:-1 tvg-id="sejp-playnow" group-title="Token - Link của tôi",SEJP (PlayNow)
+https://sg001-cdw18826playnow.ankb.qzz.io/copyrighted/api/stream/GETftplay/SEJP/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
+
 #EXTINF:-1 tvg-id="vietnam-today" tvg-logo="https://static.wikia.nocookie.net/logopedia/images/8/8c/VTV_Vietnam_Today_2023.png" group-title="TH - Truyền hình Việt",Vietnam Today
 https://live.fptplay53.net/fnxhd1/vntoday_vhls.smil/chunklist_b5000000.m3u8
 

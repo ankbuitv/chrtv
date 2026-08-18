@@ -440,3 +440,16 @@ describe('token stability (anti re-buffering)', () => {
     await expect(rewriteManifest(custom, opts)).rejects.toThrow('unsupported manifest URI port');
   });
 });
+
+describe('web player paste-and-play availability', () => {
+  it('follows PUBLIC_PLAYLIST unless ALLOW_URL_PLAY overrides it', async () => {
+    const { urlPlayEnabled } = await import('../src/player');
+    const envOf = (vars: Record<string, string>) => vars as unknown as import('../src/types').Env;
+    expect(urlPlayEnabled(envOf({}))).toBe(true); // default: public playlist => enabled
+    expect(urlPlayEnabled(envOf({ PUBLIC_PLAYLIST: 'true' }))).toBe(true);
+    expect(urlPlayEnabled(envOf({ PUBLIC_PLAYLIST: 'false' }))).toBe(false); // locked down => off
+    expect(urlPlayEnabled(envOf({ PUBLIC_PLAYLIST: 'false', ALLOW_URL_PLAY: 'true' }))).toBe(true); // explicit opt-in
+    expect(urlPlayEnabled(envOf({ PUBLIC_PLAYLIST: 'true', ALLOW_URL_PLAY: 'false' }))).toBe(false); // explicit opt-out
+    expect(urlPlayEnabled(envOf({ ALLOW_URL_PLAY: 'false' }))).toBe(false);
+  });
+});

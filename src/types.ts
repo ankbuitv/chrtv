@@ -14,6 +14,14 @@ export interface Env {
   /** Honeypot/brute-force ban duration in seconds (default: 86400, max: 604800). */
   HONEYPOT_BAN_SECONDS?: string;
   /**
+   * "false" disables the paste-and-play endpoint (POST /api/play) that lets the
+   * /xem web player stream an arbitrary operator-supplied m3u8 URL (e.g. a
+   * personal ?token= link) through the CHRTV proxy. Default enabled while
+   * PUBLIC_PLAYLIST is on; a locked-down deployment (PUBLIC_PLAYLIST=false)
+   * must set ALLOW_URL_PLAY="true" explicitly to opt in.
+   */
+  ALLOW_URL_PLAY?: string;
+  /**
    * Optional fallback HLS playlist served when a channel upstream is dead.
    * Comma-separated list allowed; candidates are tried in order. Only URLs on
    * Workers-fetchable ports are re-proxied; unsupported-port candidates are
