@@ -68,6 +68,8 @@ GitHub M3U (playlists/tv.m3u)
 - **Token**: AES-256-GCM, chứa upstream URL + iat/exp và identity đã xác thực (`MAC`, `user_id`, `access_key_id`, `session_id` khi có), tamper-proof, tự hết hạn. Token con trong manifest kế thừa cùng identity; khi bật claim `ip`, token lấy từ IP khác bị chặn `403 TOKEN_BINDING_MISMATCH`. Mỗi lần tải manifest/EPG còn kiểm tra lại trạng thái user/key/session để revoke có hiệu lực trước khi chạm upstream. Upstream URL không xuất hiện trong playlist.
 - **SSRF guard**: chỉ http/https public; chặn localhost, private IP, link-local, metadata endpoints — kiểm tra cả từng hop redirect.
 - **Circuit breaker**: upstream fail → failure state TTL 30s trong Cloudflare Cache; trong TTL trả ngay fallback manifest, hết TTL tự retry.
+- **Proxy lồng (PHP/portal → m3u8 khác)**: nhiều nguồn trả một M3U 1 dòng trỏ sang playlist thật, hoặc chỉ echo URL. CHRTV tự follow (tối đa 2 hop), rồi mới rewrite — player không bao giờ nhận wrapper để đem đi demux như MPEG-TS.
+- **DASH/MPD + ClearKey**: `#KODIPROP:inputstream.adaptive.manifest_type=mpd` (và `license_key=kid:key`) được parse lúc sync. Playlist/`/xem` phát `/mpd/{token}.mpd`; Kodi/TiviMate nhận lại KODIPROP; web player dùng dash.js. Referer/UA/`X-Access-Token` từ `#EXTVLCOPT`/`#KODIPROP` được gắn lúc fetch, không lộ ra client.
 - **Fallback là playlist LIVE tạm, không phải "kênh chết"**: khi upstream hiccup, CHRTV trả playlist live rỗng (không `#EXT-X-ENDLIST`). VLC/TiviMate/hls.js sẽ tiếp tục hỏi lại và kênh TỰ phục hồi khi upstream sống lại — thay vì player kết luận "stream đã kết thúc" rồi văng ra, bắt bạn mở lại kênh sau mỗi lần giật 1 giây.
 - **Channel health sweep**: cron `*/10 * * * *` chủ động probe batch kênh nhỏ (ưu tiên chưa check), đánh dấu `channel_health` online/offline/unknown → lộ ra qua `/api/admin/offline` + `health_status` ở `/api/admin/channels`. `offline` **chỉ khi link thật sự không vô được** (host không tới được, **im lặng quá 30s**, 404/410) và phải fail như vậy **2 lượt probe liên tiếp** mới chốt. Mọi trường hợp server vẫn trả lời — 5xx, 401/403/429/451 (auth/geo-block/rate-limit), 200 + body không phải HLS (trang anti-bot), port Worker không fetch được — đều là `unknown`, không bao giờ gán offline sai.
   Link cá nhân có credential trong query (`?token=…`, `?sign=…`, portal/MAC) **không bị probe**: sweep từ colo Cloudflare ngẫu nhiên trông y hệt chia sẻ tài khoản với hệ anti-abuse của relay/portal và có thể khiến link bị throttle/ban. Các kênh này giữ `unknown` với mã `PERSONAL_LINK` (bật lại bằng `HEALTH_PROBE_CREDENTIAL_LINKS=true`).
@@ -108,8 +110,10 @@ GitHub M3U (playlists/tv.m3u)
 | `GET /p/{session}.m3u` | Playlist session không chứa username/password |
 | `GET /lg/{username}?{password}.m3u` | Playlist riêng legacy; bắt buộc user/password D1, token bind user |
 | `GET /epg/{token}.xml` | XMLTV qua token EPG riêng, có expiry/identity binding |
-| `GET /hls/{token}.m3u8` | HLS manifest proxy (rewrite + re-tokenize mọi URI con) |
+| `GET /hls/{token}.m3u8` | HLS manifest proxy (rewrite + re-tokenize mọi URI con; nếu body là MPD thì tự sniff sang DASH) |
+| `GET /mpd/{token}.mpd` | DASH/MPD manifest proxy (rewrite BaseURL + SegmentTemplate) |
 | `GET /seg/{token}[.ext]` | Media passthrough (ts/m4s/aac/mp4/key/vtt/subtitle) |
+| `GET /dseg/{token}/{path}` | DASH segment theo prefix (player tự điền `$Number$` / `$Time$`) |
 | `GET /player_api.php` | Xtream Codes API; luôn bắt buộc user D1 thật |
 | `GET /get.php` | Xtream M3U; luôn bắt buộc user D1 thật |
 | `GET /live/{user}/{pass}/{id}.m3u8` | Đổi Xtream credential thành redirect tới URL live opaque |

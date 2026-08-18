@@ -4,6 +4,7 @@ import { classifyUpstreamStatus } from '../proxy/upstream';
 import { isSafeUpstreamUrl } from '../utils/urlsafe';
 import { isFetchablePort } from '../utils/ports';
 import { looksLikeHls } from '../hls/rewrite';
+import { looksLikeMpd } from '../dash/rewrite';
 import { logEvent } from '../utils/http';
 
 /**
@@ -298,7 +299,7 @@ export async function probeChannel(url: string): Promise<ProbeResult> {
     // 200 + non-HLS body: reachable but serving something odd — frequently an
     // anti-bot/interstitial page that only the datacenter probe sees while
     // real players stream fine. Suspicious, but NOT "link unreachable".
-    return looksLikeHls(prefix)
+    return looksLikeHls(prefix) || looksLikeMpd(prefix)
       ? { status: 'online', errorCode: '', httpStatus: res.status }
       : { status: 'unknown', errorCode: ErrorCodes.INVALID_HLS, httpStatus: res.status };
   }

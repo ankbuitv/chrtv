@@ -2233,3 +2233,133 @@ describe('upstream client-IP forwarding (opt-in, for operator-owned relays)', ()
   });
 });
 
+describe('nested proxy unwrap + DASH', () => {
+  async function mintToken(upstream: string, opts: { exp?: number; channel?: string } = {}): Promise<string> {
+    const now = Math.floor(Date.now() / 1000);
+    return createToken(env.SECRET_KEY, {
+      u: upstream,
+      iat: now,
+      exp: opts.exp ?? now + 300,
+      k: 'm',
+      ...(opts.channel ? { c: opts.channel } : {}),
+    });
+  }
+
+  it('follows a PHP-proxy wrapper that points at another m3u8 and rewrites the inner playlist', async () => {
+    const wrapper = '#EXTM3U\n#EXTINF:-1,\nhttps://cdn.example.com/live/real/index.m3u8\n';
+    const inner = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg1.ts\n#EXT-X-ENDLIST\n';
+    fetchMock.get('https://proxy.example.com').intercept({ path: '/Stream/index.php?id=vtv5&ext=.m3u8' }).reply(200, wrapper);
+    fetchMock.get('https://cdn.example.com').intercept({ path: '/live/real/index.m3u8' }).reply(200, inner);
+
+    const token = await mintToken('https://proxy.example.com/Stream/index.php?id=vtv5&ext=.m3u8');
+    const res = await SELF.fetch(`${BASE}/hls/${token}.m3u8`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('X-CHRTV-Fallback')).toBeNull();
+    const body = await res.text();
+    expect(body).toContain(`${BASE}/seg/`);
+    expect(body).not.toContain('cdn.example.com');
+    expect(body).not.toContain('proxy.example.com');
+    expect(body).toContain('#EXT-X-TARGETDURATION');
+    const segUrl = body.split('\n').find((l) => l.includes('/seg/'))!;
+    const segToken = segUrl.match(/\/seg\/([^.?]+)/)![1]!;
+    const verdict = await verifyToken(env.SECRET_KEY, segToken);
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) expect(verdict.payload.u).toBe('https://cdn.example.com/live/real/seg1.ts');
+  });
+
+  it('follows a bare-URL body (proxy that just echoes the real m3u8)', async () => {
+    const inner = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nchunk.ts\n';
+    fetchMock.get('https://echo.example.com').intercept({ path: '/go' }).reply(200, 'https://cdn2.example.com/ch/index.m3u8');
+    fetchMock.get('https://cdn2.example.com').intercept({ path: '/ch/index.m3u8' }).reply(200, inner);
+
+    const token = await mintToken('https://echo.example.com/go');
+    const res = await SELF.fetch(`${BASE}/hls/${token}.m3u8`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain(`${BASE}/seg/`);
+    expect(body).not.toContain('cdn2.example.com');
+  });
+
+  it('rewrites an MPD and serves it from both /hls/ (sniff) and /mpd/', async () => {
+    const mpd = [
+      '<?xml version="1.0"?>',
+      '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic">',
+      '  <BaseURL>https://dash.example.com/live/ch/</BaseURL>',
+      '  <Period><AdaptationSet><Representation>',
+      '    <SegmentTemplate media="seg_$Number$.m4s" initialization="init.mp4"/>',
+      '  </Representation></AdaptationSet></Period>',
+      '</MPD>',
+    ].join('\n');
+    fetchMock.get('https://dash.example.com').intercept({ path: '/live/ch/manifest.mpd' }).reply(200, mpd).persist();
+
+    const token = await mintToken('https://dash.example.com/live/ch/manifest.mpd');
+    const sniffed = await SELF.fetch(`${BASE}/hls/${token}.m3u8`);
+    expect(sniffed.status).toBe(200);
+    expect(sniffed.headers.get('Content-Type')).toContain('dash+xml');
+    const sniffedBody = await sniffed.text();
+    expect(sniffedBody).toContain(`${BASE}/dseg/`);
+    expect(sniffedBody).not.toContain('dash.example.com');
+    expect(sniffedBody).toContain('seg_$Number$.m4s');
+
+    const direct = await SELF.fetch(`${BASE}/mpd/${token}.mpd`);
+    expect(direct.status).toBe(200);
+    expect(direct.headers.get('Content-Type')).toContain('dash+xml');
+    expect(await direct.text()).toContain('/dseg/');
+  });
+
+  it('/dseg/{token}/{path} fetches the joined upstream and rejects traversal', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await createToken(env.SECRET_KEY, {
+      u: 'https://dash.example.com/live/ch/',
+      iat: now,
+      exp: now + 300,
+      k: 'b',
+    });
+    fetchMock
+      .get('https://dash.example.com')
+      .intercept({ path: '/live/ch/seg_12.m4s' })
+      .reply(200, 'FAKE-M4S', { headers: { 'Content-Type': 'video/iso.segment' } });
+
+    const ok = await SELF.fetch(`${BASE}/dseg/${token}/seg_12.m4s`);
+    expect(ok.status).toBe(200);
+    expect(await ok.text()).toBe('FAKE-M4S');
+
+    // Single path segment so the URL parser cannot normalize ".." away.
+    const traversal = await SELF.fetch(`${BASE}/dseg/${token}/ok%2F..%2Fsecret.m4s`);
+    expect(traversal.status).toBe(400);
+    expect(((await traversal.json()) as { error: string }).error).toBe('UNSAFE_URL');
+  });
+
+  it('health probe treats a live MPD as online', async () => {
+    const mpd = '<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic"><Period/></MPD>';
+    fetchMock.get('https://hprobe-mpd.example.com').intercept({ path: '/live.mpd' }).reply(200, mpd);
+    const r = await probeChannel('https://hprobe-mpd.example.com/live.mpd');
+    expect(r).toEqual({ status: 'online', errorCode: '', httpStatus: 200 });
+  });
+
+  it('playlist emits /mpd/ + KODIPROP ClearKey for a DASH channel', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO channels (id, xtream_id, name, url, tvg_id, tvg_logo, category_id, position, active, sync_seq, created_at, updated_at, play_opts)
+       VALUES ('mpdchannel000001', 400001, 'TV360 DASH', 'https://vmttv.example.com/tv360/?id=12', 'tv360-12', '', NULL, 9, 1, 1, ?, ?, ?)`,
+    )
+      .bind(
+        now,
+        now,
+        JSON.stringify({
+          kind: 'mpd',
+          clearkey: { kid: '29b3e7c5de895bfa8850f16dad16e378', key: '72a9e1be1d94ad66207f1ac61bcf7681' },
+        }),
+      )
+      .run();
+
+    const res = await SELF.fetch(`${BASE}/tv.m3u`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('manifest_type=mpd');
+    expect(body).toContain('license_key=29b3e7c5de895bfa8850f16dad16e378:72a9e1be1d94ad66207f1ac61bcf7681');
+    expect(body).toContain(`${BASE}/mpd/`);
+    expect(body).not.toContain('vmttv.example.com');
+  });
+});
+

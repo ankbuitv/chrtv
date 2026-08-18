@@ -2,15 +2,12 @@
  * /xem — the built-in web player.
  *
  * Watches any channel synced from the playlist (including token links like
- * …/index.m3u8?token=…) directly in the browser: the page lists the same
- * tokenized /hls/ manifests /tv.m3u serves, and plays them via hls.js (or
- * native HLS on Safari/iOS). A paste box lets the operator try a brand-new
- * token link through the proxy before adding it to the playlist.
+ * …/index.m3u8?token=… and DASH .mpd + ClearKey) directly in the browser:
+ * HLS via hls.js, DASH via dash.js. A paste box lets the operator try a
+ * brand-new token link through the proxy before adding it to the playlist.
  *
  * No secrets are embedded in the HTML; tokens are fetched per session from
- * /api/channels and /api/play. The page works without JavaScript from jsDelivr
- * only in native-HLS browsers; elsewhere hls.js is loaded from the CDN with a
- * graceful error hint when it is unavailable.
+ * /api/channels and /api/play.
  */
 
 const PLAYER_STYLE = `
@@ -55,18 +52,19 @@ export function playerPage(): Response {
   const html = `<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CHRTV — Xem TV</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/dashjs@4/dist/dash.all.min.js" defer></script>
 <style>${PLAYER_STYLE}</style></head>
 <body>
 <header><a class="brand" href="/">CHRTV · XEM</a><span class="hint" id="count">Đang tải danh sách kênh…</span></header>
 <div class="wrap">
 <aside>
-  <form class="paste" id="paste-form"><input id="paste-url" type="text" placeholder="Dán link .m3u8 (có ?token=…) để thử" autocomplete="off" spellcheck="false"><button class="primary" type="submit">Xem</button></form>
+  <form class="paste" id="paste-form"><input id="paste-url" type="text" placeholder="Dán link .m3u8 / .mpd (có ?token=…) để thử" autocomplete="off" spellcheck="false"><button class="primary" type="submit">Xem</button></form>
   <div class="filters"><input id="search" type="search" placeholder="Tìm kênh…" autocomplete="off"><select id="group"><option value="">Tất cả nhóm</option></select></div>
   <div id="list"></div>
 </aside>
 <main>
   <div class="stage"><video id="video" controls playsinline></video><div class="msg" id="msg"></div></div>
-  <div class="bar"><span class="title" id="title">Chưa chọn kênh</span><select id="quality"><option value="-1">Tự động</option></select><button id="retry">Tải lại</button><button id="copy-src">Copy link .m3u8</button><button id="fs">Toàn màn hình</button><span class="state" id="state"></span></div>
+  <div class="bar"><span class="title" id="title">Chưa chọn kênh</span><select id="quality"><option value="-1">Tự động</option></select><button id="retry">Tải lại</button><button id="copy-src">Copy link</button><button id="fs">Toàn màn hình</button><span class="state" id="state"></span></div>
 </main>
 </div>
 <footer><span>Mở trong app: <a href="/tv.m3u">/tv.m3u</a></span><span>Link token hết hạn? Sửa <code>playlists/tv.m3u</code> rồi chờ sync (~15 phút) hoặc bấm Sync trong /admin.</span></footer>
@@ -77,7 +75,7 @@ export function playerPage(): Response {
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
       'Content-Security-Policy':
-        "default-src 'none'; style-src 'unsafe-inline'; script-src 'self' https://cdn.jsdelivr.net; connect-src 'self'; img-src 'self' data: https:; media-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'self' https://cdn.jsdelivr.net; connect-src 'self'; img-src 'self' data: https:; media-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
       'Referrer-Policy': 'no-referrer',
       'X-Content-Type-Options': 'nosniff',
       'X-Frame-Options': 'DENY',
@@ -88,9 +86,8 @@ export function playerPage(): Response {
 const PLAYER_JS = String.raw`
 const $=s=>document.querySelector(s);
 const video=$('#video'),listEl=$('#list'),msgEl=$('#msg'),stateEl=$('#state'),titleEl=$('#title'),qualityEl=$('#quality'),groupEl=$('#group'),searchEl=$('#search'),countEl=$('#count');
-let channels=[],hls=null,current=null,retries=0;
+let channels=[],hls=null,dash=null,current=null,retries=0;
 
-// Access key (non-public deployments): remember ?key=&mac= for API calls.
 const qs=new URLSearchParams(location.search);
 const auth=()=>{const p=new URLSearchParams();const key=sessionStorage.getItem('chrtv_key')||qs.get('key');const mac=sessionStorage.getItem('chrtv_mac')||qs.get('mac');if(key){p.set('key',key);if(mac)p.set('mac',mac)}return p.toString()};
 if(qs.get('key'))sessionStorage.setItem('chrtv_key',qs.get('key'));
@@ -99,18 +96,34 @@ if(qs.get('mac'))sessionStorage.setItem('chrtv_mac',qs.get('mac'));
 const setState=(t,cls='')=>{stateEl.textContent=t;stateEl.className='state '+cls};
 const setMsg=t=>{msgEl.textContent=t||''};
 
-function destroy(){if(hls){hls.destroy();hls=null}video.removeAttribute('src');video.load()}
+function hexToB64Url(hex){
+  const bytes=hex.match(/../g)||[];
+  const bin=String.fromCharCode.apply(null,bytes.map(h=>parseInt(h,16)));
+  return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function destroy(){
+  if(hls){hls.destroy();hls=null}
+  if(dash){try{dash.reset()}catch(e){}dash=null}
+  video.removeAttribute('src');video.load();
+}
 
-function play(src,title){
-  current={src,title};titleEl.textContent=title;retries=0;destroy();setMsg('Đang kết nối…');setState('');
+function play(src,title,meta){
+  current={src,title,meta:meta||{}};titleEl.textContent=title;retries=0;destroy();setMsg('Đang kết nối…');setState('');
   qualityEl.innerHTML='<option value="-1">Tự động</option>';
+  const isDash=/\.mpd(\?|$)/i.test(src)||(meta&&meta.kind==='mpd');
+  if(isDash&&window.dashjs&&dashjs.MediaPlayer){
+    dash=dashjs.MediaPlayer().create();
+    dash.updateSettings({streaming:{delay:{liveDelayFragmentCount:3}}});
+    if(meta&&meta.clearkey&&meta.clearkey.kid&&meta.clearkey.key){
+      dash.setProtectionData({'org.w3.clearkey':{clearkeys:{[hexToB64Url(meta.clearkey.kid)]:hexToB64Url(meta.clearkey.key)}}});
+    }
+    dash.on(dashjs.MediaPlayer.events.PLAYBACK_STARTED,()=>{setMsg('');setState('Đang phát ● (DASH)','ok')});
+    dash.on(dashjs.MediaPlayer.events.ERROR,()=>{setMsg('');setState('Không phát được — kênh DASH lỗi hoặc thiếu ClearKey','err')});
+    dash.initialize(video,src,true);
+    return;
+  }
   const native=video.canPlayType('application/vnd.apple.mpegurl');
   if(window.Hls&&Hls.isSupported()){
-    // Timeouts mirror the gateway's declared 30s upstream policy: slow relays
-    // routinely spend 10-25s to first byte, and hls.js defaults (10s manifest/
-    // level, 20s fragment) would abort the request while CHRTV is still
-    // waiting on the upstream — producing a fake "mất kết nối" retry loop
-    // instead of a slow-but-successful tune-in.
     hls=new Hls({enableWorker:true,liveSyncDurationCount:3,
       manifestLoadingTimeOut:30000,levelLoadingTimeOut:30000,fragLoadingTimeOut:30000,
       manifestLoadingMaxRetry:3,levelLoadingMaxRetry:4,fragLoadingMaxRetry:6});
@@ -131,13 +144,13 @@ function play(src,title){
     video.src=src;video.play().catch(()=>{});
     setMsg('');setState('Đang phát ● (HLS gốc)','ok');
   }else{
-    setMsg('');setState('Trình duyệt không hỗ trợ HLS và không tải được hls.js (mạng/CDN chặn?)','err');
+    setMsg('');setState('Trình duyệt không hỗ trợ HLS/DASH (mạng/CDN chặn?)','err');
   }
 }
 qualityEl.onchange=()=>{if(hls)hls.currentLevel=Number(qualityEl.value)};
-$('#retry').onclick=()=>{if(current)play(current.src,current.title)};
+$('#retry').onclick=()=>{if(current)play(current.src,current.title,current.meta)};
 $('#fs').onclick=()=>{if(document.fullscreenElement)document.exitFullscreen();else$('.stage').requestFullscreen&&$('.stage').requestFullscreen()};
-$('#copy-src').onclick=async()=>{if(!current)return;await navigator.clipboard.writeText(new URL(current.src,location.origin).toString());setState('Đã copy link .m3u8 (link app dùng trực tiếp được)','ok')};
+$('#copy-src').onclick=async()=>{if(!current)return;await navigator.clipboard.writeText(new URL(current.src,location.origin).toString());setState('Da copy link','ok')};
 
 function render(){
   const g=groupEl.value,q=searchEl.value.trim().toLowerCase();
@@ -147,12 +160,12 @@ function render(){
     const b=document.createElement('button');b.type='button';b.className='ch'+(current&&current.src===c.url?' active':'');
     if(c.logo){const img=document.createElement('img');img.src=c.logo;img.loading='lazy';img.alt='';img.onerror=()=>{img.replaceWith(noImg())};b.append(img)}else b.append(noImg());
     const nm=document.createElement('span');nm.className='nm';nm.textContent=c.name;const gp=document.createElement('span');gp.className='gp';gp.textContent=c.group;nm.prepend(gp);b.append(nm);
-    b.onclick=()=>{play(c.url,c.name);history.replaceState(null,'','/xem?ch='+encodeURIComponent(c.id))};
+    b.onclick=()=>{play(c.url,c.name,{kind:c.kind,clearkey:c.clearkey});history.replaceState(null,'','/xem?ch='+encodeURIComponent(c.id))};
     listEl.append(b);
   }
-  countEl.textContent=items.length+' / '+channels.length+' kênh';
+  countEl.textContent=items.length+' / '+channels.length+' kenh';
 }
-function noImg(){const d=document.createElement('span');d.className='noimg';d.textContent='📺';return d}
+function noImg(){const d=document.createElement('span');d.className='noimg';d.textContent='TV';return d}
 groupEl.onchange=render;searchEl.oninput=render;
 
 async function load(){
@@ -162,29 +175,28 @@ async function load(){
     if(!res.ok)throw new Error(body.error||('HTTP '+res.status));
     channels=body.channels||[];
     const groups=[...new Set(channels.map(c=>c.group))];
-    groupEl.innerHTML='<option value="">Tất cả nhóm ('+groups.length+')</option>'+groups.map(g=>'<option>'+g.replace(/[&<>"]/g,'')+'</option>').join('');
+    groupEl.innerHTML='<option value="">Tat ca nhom ('+groups.length+')</option>'+groups.map(g=>'<option>'+g.replace(/[&<>"]/g,'')+'</option>').join('');
     render();
     const ch=new URLSearchParams(location.search).get('ch');
     const pre=ch?channels.find(c=>c.id===ch):null;
-    if(pre)play(pre.url,pre.name);
-  }catch(e){countEl.textContent='Không tải được kênh';setState('Lỗi: '+e.message+' — cần ?key=… nếu playlist đang khóa','err')}
+    if(pre)play(pre.url,pre.name,{kind:pre.kind,clearkey:pre.clearkey});
+  }catch(e){countEl.textContent='Khong tai duoc kenh';setState('Loi: '+e.message+' — can ?key= neu playlist dang khoa','err')}
 }
 
 $('#paste-form').onsubmit=async e=>{
   e.preventDefault();
   const url=$('#paste-url').value.trim();
   if(!url)return;
-  setState('Đang tạo link xem…');setMsg('');
+  setState('Dang tao link xem…');setMsg('');
   try{
     const res=await fetch('/api/play',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
     const body=await res.json();
     if(!res.ok)throw new Error(body.error||('HTTP '+res.status));
-    play(body.src,'Link dán · '+new URL(url).hostname);
+    play(body.src,'Link dan · '+new URL(url).hostname,{kind:body.kind});
     $('#paste-url').value='';
-  }catch(err){setState('Không xem được: '+err.message,'err')}
+  }catch(err){setState('Khong xem duoc: '+err.message,'err')}
 };
 
-// ?url=<m3u8> — mở luôn player với một link token cụ thể.
 const preUrl=qs.get('url');
 load().then(()=>{if(preUrl)$('#paste-form').requestSubmit()});
 `;

@@ -4,7 +4,9 @@ import { isSafeUpstreamUrl } from '../src/utils/urlsafe';
 import { isFetchablePort } from '../src/utils/ports';
 import { createToken, parseTokenBindingPolicy, requestTokenBinding, verifyToken } from '../src/token';
 import { parsePlaylist, PlaylistError } from '../src/playlist/parser';
-import { rewriteManifest, looksLikeHls, HlsError } from '../src/hls/rewrite';
+import { rewriteManifest, looksLikeHls, looksLikePlaylistUrl, isWrapperManifest, convertWrapperToMaster, HlsError } from '../src/hls/rewrite';
+import { looksLikeMpd, rewriteMpd, joinDashPath, mpdDirectory } from '../src/dash/rewrite';
+import { applyDirective, emptyPlayOpts, parsePlayOpts, serializePlayOpts, resolvedKind } from '../src/playlist/playOpts';
 import { buildErrorManifest } from '../src/hls/errorManifest';
 import { isCredentialBearingUrl } from '../src/playlist/health';
 import { hashPassword, hashAccessKey, timingSafeEqual, randomHex } from '../src/utils/crypto';
@@ -285,7 +287,7 @@ describe('HLS rewriting', () => {
     const manifest = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nsegment001.ts\n#EXT-X-ENDLIST\n';
     const out = await rewriteManifest(manifest, opts);
     const segLine = out.split('\n').find((l) => l.includes('/seg/'))!;
-    expect(await verifyProxied(segLine)).toBe('https://origin.example.com/live/abc/segment001.ts');
+    expect(await verifyProxied(segLine)).toBe('https://origin.example.com/live/abc/segment001.ts?auth=1');
   });
   it('handles absolute, protocol-relative and query-string URIs', async () => {
     const manifest = [
@@ -309,7 +311,7 @@ describe('HLS rewriting', () => {
     const out = await rewriteManifest(manifest, opts);
     const line = out.split('\n').find((l) => l.includes('/hls/'))!;
     expect(line).toContain('.m3u8');
-    expect(await verifyProxied(line)).toBe('https://origin.example.com/live/abc/hd/index.m3u8');
+    expect(await verifyProxied(line)).toBe('https://origin.example.com/live/abc/hd/index.m3u8?auth=1');
   });
   it('rewrites EXT-X-KEY URIs', async () => {
     const manifest = '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="keys/k1.key",IV=0x1234\n#EXTINF:6.0,\ns.ts\n#EXT-X-ENDLIST\n';
@@ -317,7 +319,7 @@ describe('HLS rewriting', () => {
     const keyLine = out.split('\n').find((l) => l.startsWith('#EXT-X-KEY'))!;
     expect(keyLine).toContain('IV=0x1234');
     const uri = keyLine.match(/URI="([^"]+)"/)![1]!;
-    expect(await verifyProxied(uri)).toBe('https://origin.example.com/live/abc/keys/k1.key');
+    expect(await verifyProxied(uri)).toBe('https://origin.example.com/live/abc/keys/k1.key?auth=1');
   });
   it('rewrites media, key, subtitle, rendition, image, and low-latency URI attributes', async () => {
     const manifest = [
@@ -337,7 +339,7 @@ describe('HLS rewriting', () => {
     const media = out.split('\n').find((l) => l.startsWith('#EXT-X-MEDIA'))!;
     expect(media).toContain('/hls/'); // playlists proxied as manifests
     const map = out.split('\n').find((l) => l.startsWith('#EXT-X-MAP'))!;
-    expect(await verifyProxied(map.match(/URI="([^"]+)"/)![1]!)).toBe('https://origin.example.com/live/abc/init.mp4');
+    expect(await verifyProxied(map.match(/URI="([^"]+)"/)![1]!)).toBe('https://origin.example.com/live/abc/init.mp4?auth=1');
     const part = out.split('\n').find((l) => l.startsWith('#EXT-X-PART'))!;
     expect(part).toContain('/seg/');
     const hint = out.split('\n').find((l) => l.startsWith('#EXT-X-PRELOAD-HINT'))!;
@@ -477,6 +479,125 @@ describe('credential-bearing URL detection (health sweep skip)', () => {
   });
   it('never throws on malformed input', () => {
     expect(isCredentialBearingUrl('not a url')).toBe(false);
+  });
+});
+
+describe('nested playlist wrappers (proxy → other m3u8)', () => {
+  it('detects playlist-like URLs including php?ext=.m3u8', () => {
+    expect(looksLikePlaylistUrl('https://cdn.example.com/live/index.m3u8')).toBe(true);
+    expect(looksLikePlaylistUrl('https://cdn.example.com/live/manifest.mpd')).toBe(true);
+    expect(looksLikePlaylistUrl('https://proxy.example.com/Stream/index.php?id=vtv5&ext=.m3u8')).toBe(true);
+    expect(looksLikePlaylistUrl('https://cdn.example.com/seg001.ts')).toBe(false);
+  });
+
+  it('flags a 1-URI EXTINF wrapper (no TARGETDURATION) as a wrapper', () => {
+    const wrapper = '#EXTM3U\n#EXTINF:-1,\nhttps://cdn.example.com/live/index.m3u8\n';
+    expect(isWrapperManifest(wrapper, 'https://proxy.example.com/go.php')).toBe(true);
+    const media = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg.ts\n';
+    expect(isWrapperManifest(media, 'https://cdn.example.com/index.m3u8')).toBe(false);
+  });
+
+  it('rewrites a leftover wrapper as a real HLS master, not as a media segment', async () => {
+    const wrapper = '#EXTM3U\n#EXTINF:-1,HD\nhttps://cdn.example.com/live/index.m3u8\n';
+    const out = await rewriteManifest(wrapper, {
+      secret: SECRET,
+      baseUrl: 'https://proxy.example.com/Stream/index.php?id=ch&ext=.m3u8',
+      publicOrigin: 'https://chrtv.example.com',
+    });
+    expect(out).toContain('#EXT-X-STREAM-INF');
+    expect(out).toContain('/hls/');
+    expect(out).not.toContain('/seg/');
+    expect(out).not.toContain('cdn.example.com');
+  });
+
+  it('converts a multi-URL wrapper into a named master playlist', () => {
+    const wrapper = '#EXTM3U\n#EXTINF:-1,HD\nhttps://a.example.com/hd.m3u8\n#EXTINF:-1,SD\nhttps://a.example.com/sd.m3u8\n';
+    const master = convertWrapperToMaster(wrapper);
+    expect(master).toContain('NAME="HD"');
+    expect(master).toContain('NAME="SD"');
+    expect(master).toContain('#EXT-X-STREAM-INF');
+    expect(master).not.toContain('#EXTINF');
+  });
+});
+
+describe('DASH / MPD rewriting', () => {
+  const opts = {
+    secret: SECRET,
+    baseUrl: 'https://origin.example.com/live/ch/manifest.mpd?token=abc',
+    publicOrigin: 'https://chrtv.example.com',
+  };
+
+  it('recognizes MPD documents', () => {
+    expect(looksLikeMpd('<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>')).toBe(true);
+    expect(looksLikeMpd('#EXTM3U\n')).toBe(false);
+    expect(looksLikeMpd('<html>nope</html>')).toBe(false);
+  });
+
+  it('rewrites BaseURL to a /dseg/ prefix and leaves relative templates alone', async () => {
+    const mpd = [
+      '<?xml version="1.0"?>',
+      '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic">',
+      '  <BaseURL>https://origin.example.com/live/ch/</BaseURL>',
+      '  <Period><AdaptationSet><Representation>',
+      '    <SegmentTemplate media="seg_$Number$.m4s" initialization="init.mp4"/>',
+      '  </Representation></AdaptationSet></Period>',
+      '</MPD>',
+    ].join('\n');
+    const out = await rewriteMpd(mpd, opts);
+    expect(out).toContain('https://chrtv.example.com/dseg/');
+    expect(out).not.toContain('origin.example.com');
+    expect(out).toContain('media="seg_$Number$.m4s"');
+    expect(out).toContain('initialization="init.mp4"');
+  });
+
+  it('injects a BaseURL when the MPD has none', async () => {
+    const mpd = '<?xml version="1.0"?><MPD type="dynamic"><Period/></MPD>';
+    const out = await rewriteMpd(mpd, opts);
+    expect(out).toMatch(/<BaseURL>https:\/\/chrtv\.example\.com\/dseg\/[^<]+\/<\/BaseURL>/);
+  });
+
+  it('joinDashPath stays inside the base directory and keeps query tokens', () => {
+    const base = mpdDirectory('https://origin.example.com/live/ch/manifest.mpd?token=abc');
+    expect(joinDashPath(base, 'seg_1.m4s')).toBe('https://origin.example.com/live/ch/seg_1.m4s?token=abc');
+    expect(joinDashPath(base, '../secret.m4s')).toBeNull();
+    expect(joinDashPath(base, 'https://evil.example.com/x.m4s')).toBeNull();
+    expect(joinDashPath(base, '/abs.m4s')).toBeNull();
+  });
+});
+
+describe('play opts (KODIPROP / EXTVLCOPT)', () => {
+  it('captures KODIPROP/EXTVLCOPT from a playlist entry', async () => {
+    const mpd = [
+      '#EXTM3U',
+      '#EXTINF:-1 tvg-id="tv360-12" group-title="Sports",TV360+12',
+      '#EXTVLCOPT:http-user-agent=Dalvik/2.1.0',
+      '#KODIPROP:inputstream.adaptive.manifest_type=mpd',
+      '#KODIPROP:inputstream.adaptive.license_type=clearkey',
+      '#KODIPROP:inputstream.adaptive.license_key=29b3e7c5de895bfa8850f16dad16e378:72a9e1be1d94ad66207f1ac61bcf7681',
+      'https://vmttv.example.com/tv360/?id=tv360-12',
+    ].join('\n');
+    const res = await parsePlaylist(mpd);
+    expect(res.channels).toHaveLength(1);
+    expect(res.channels[0]!.playOpts.kind).toBe('mpd');
+    expect(res.channels[0]!.playOpts.ua).toBe('Dalvik/2.1.0');
+    expect(res.channels[0]!.playOpts.clearkey).toEqual({
+      kid: '29b3e7c5de895bfa8850f16dad16e378',
+      key: '72a9e1be1d94ad66207f1ac61bcf7681',
+    });
+  });
+
+  it('round-trips JSON and ignores blocked headers', () => {
+    const opts = emptyPlayOpts();
+    applyDirective(opts, '#KODIPROP:inputstream.adaptive.stream_headers=X-Access-Token=abc&Cookie=evil&User-Agent=VLC');
+    expect(opts.ua).toBe('VLC');
+    expect(opts.headers).toEqual({ 'X-Access-Token': 'abc' });
+    const raw = serializePlayOpts(opts);
+    expect(parsePlayOpts(raw).headers).toEqual({ 'X-Access-Token': 'abc' });
+  });
+
+  it('resolves manifest kind from the URL when undeclared', () => {
+    expect(resolvedKind(emptyPlayOpts(), 'https://cdn.example.com/live.mpd')).toBe('mpd');
+    expect(resolvedKind(emptyPlayOpts(), 'https://cdn.example.com/live.m3u8')).toBe('hls');
   });
 });
 

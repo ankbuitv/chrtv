@@ -7,6 +7,7 @@ import { resolvePlaylistAccess } from '../playlist/access';
 import { buildChannelEntries } from '../playlist/output';
 import { recordAuthEvent } from '../auth/audit';
 import { createToken, DEFAULT_MANIFEST_TTL, requestTokenBinding } from '../token';
+import { kindFromUrl, tokenHintsFromPlayOpts } from '../playlist/playOpts';
 
 /**
  * Web player (/xem) API.
@@ -117,8 +118,11 @@ export async function handlePlayApi(req: Request, env: Env, requestId: string): 
   const binding = requestTokenBinding(req, {}, env.TOKEN_BINDING);
   const iat = Math.floor(Date.now() / 1000);
   const exp = iat + PLAY_TOKEN_TTL;
-  const token = await createToken(env.SECRET_KEY, { u: url, iat, exp, k: 'm', ...binding });
-  const src = `${new URL(req.url).origin}/hls/${token}.m3u8`;
+  const hints = tokenHintsFromPlayOpts('', url);
+  const kind = kindFromUrl(url) === 'mpd' ? 'mpd' : 'hls';
+  const token = await createToken(env.SECRET_KEY, { u: url, iat, exp, k: 'm', ...binding, ...hints });
+  const origin = new URL(req.url).origin;
+  const src = kind === 'mpd' ? `${origin}/mpd/${token}.mpd` : `${origin}/hls/${token}.m3u8`;
 
   await recordAuthEvent(req, env, {
     eventType: 'playlist',
@@ -127,7 +131,7 @@ export async function handlePlayApi(req: Request, env: Env, requestId: string): 
   });
 
   logEvent(requestId, '/api/play', 'OK', 'token minted');
-  return jsonResponse({ src, expires_at: exp }, 200, {
+  return jsonResponse({ src, expires_at: exp, kind }, 200, {
     'Access-Control-Allow-Origin': '*',
     'X-Request-ID': requestId,
   });

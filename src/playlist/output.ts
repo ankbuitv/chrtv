@@ -2,6 +2,7 @@ import type { ChannelRow, Env } from '../types';
 import { listActiveChannels } from '../db/channels';
 import { createToken, TOKEN_STABILITY_WINDOW, tokenBindingSeed, type TokenBinding } from '../token';
 import { getSetting } from '../db/settings';
+import { parsePlayOpts, resolvedKind, tokenHintsFromPlayOpts } from './playOpts';
 
 const DEFAULT_PLAYLIST_TOKEN_TTL = 30 * 24 * 60 * 60; // 30 days
 
@@ -19,14 +20,22 @@ export interface ChannelEntry {
   group: string;
   logo: string;
   tvgId: string;
-  /** Tokenized CHRTV manifest URL ({origin}/hls/{token}.m3u8). */
+  /** Tokenized CHRTV manifest URL (`/hls/{token}.m3u8` or `/mpd/{token}.mpd`). */
   url: string;
+  /** Manifest kind the player should use. */
+  kind: 'hls' | 'mpd';
+  /** ClearKey kid/key when the source playlist declared one. */
+  clearkey?: { kid: string; key: string };
 }
 
 export interface ChannelEntries {
   entries: ChannelEntry[];
   /** Tokenized EPG URL bound to the same identity. */
   epgUrl: string;
+}
+
+function mediaPath(origin: string, token: string, kind: 'hls' | 'mpd'): string {
+  return kind === 'mpd' ? `${origin}/mpd/${token}.mpd` : `${origin}/hls/${token}.m3u8`;
 }
 
 /**
@@ -69,31 +78,39 @@ export async function buildChannelEntries(
   const epgUrl = `${origin}/epg/${epgToken}.xml`;
 
   const tokens = await Promise.all(
-    channels.map((ch) =>
-      createToken(
+    channels.map((ch) => {
+      const hints = tokenHintsFromPlayOpts(ch.play_opts, ch.url);
+      return createToken(
         env.SECRET_KEY,
-        { u: ch.url, iat, exp, k: 'm', c: ch.id, ...binding },
+        { u: ch.url, iat, exp, k: 'm', c: ch.id, ...binding, ...hints },
         `ch|${iat}|${exp}|${ch.id}|${ch.url}|${bindingSeed}`,
-      ),
-    ),
+      );
+    }),
   );
 
-  const entries: ChannelEntry[] = channels.map((ch: ChannelRow, i: number) => ({
-    id: ch.id,
-    name: ch.name,
-    group: ch.category_name ?? 'Uncategorized',
-    logo: ch.tvg_logo,
-    tvgId: ch.tvg_id,
-    url: `${origin}/hls/${tokens[i]}.m3u8`,
-  }));
+  const entries: ChannelEntry[] = channels.map((ch: ChannelRow, i: number) => {
+    const opts = parsePlayOpts(ch.play_opts);
+    const kind = resolvedKind(opts, ch.url);
+    const entry: ChannelEntry = {
+      id: ch.id,
+      name: ch.name,
+      group: ch.category_name ?? 'Uncategorized',
+      logo: ch.tvg_logo,
+      tvgId: ch.tvg_id,
+      url: mediaPath(origin, tokens[i]!, kind),
+      kind,
+    };
+    if (opts.clearkey) entry.clearkey = opts.clearkey;
+    return entry;
+  });
   return { entries, epgUrl };
 }
 
 /**
- * Generate the user-facing M3U. Every channel entry points to
- * {origin}/hls/{token}.m3u8, so raw upstream URLs never appear in the playlist.
- * A channel on a port the Worker cannot fetch remains opaque but fails closed
- * to a proxyable fallback/error manifest; CHRTV never redirects to its origin.
+ * Generate the user-facing M3U. Every channel entry points to a tokenized
+ * /hls/ or /mpd/ URL, so raw upstream URLs never appear in the playlist.
+ * DASH + ClearKey channels re-emit the Kodi license props (kid:key only —
+ * never the upstream origin or stream_headers) so TiviMate/Kodi can decrypt.
  */
 export async function buildPlaylist(
   env: Env,
@@ -113,6 +130,14 @@ export async function buildPlaylist(
     ]
       .filter(Boolean)
       .join(' ');
+    if (ch.kind === 'mpd') {
+      lines.push('#KODIPROP:inputstreamaddon=inputstream.adaptive');
+      lines.push('#KODIPROP:inputstream.adaptive.manifest_type=mpd');
+      if (ch.clearkey) {
+        lines.push('#KODIPROP:inputstream.adaptive.license_type=clearkey');
+        lines.push(`#KODIPROP:inputstream.adaptive.license_key=${ch.clearkey.kid}:${ch.clearkey.key}`);
+      }
+    }
     lines.push(`#EXTINF:-1 ${attrs},${escapeName(ch.name)}`);
     lines.push(ch.url);
   }

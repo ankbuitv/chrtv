@@ -1,7 +1,7 @@
 import type { ChannelRow } from '../types';
 
 const CHANNEL_COLUMNS =
-  'c.id, c.xtream_id, c.name, c.url, c.tvg_id, c.tvg_logo, c.category_id, c.position, c.active, cat.name AS category_name';
+  'c.id, c.xtream_id, c.name, c.url, c.tvg_id, c.tvg_logo, c.category_id, c.position, c.active, c.play_opts, cat.name AS category_name';
 
 export async function listActiveChannels(db: D1Database): Promise<ChannelRow[]> {
   const { results } = await db

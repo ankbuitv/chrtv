@@ -1,5 +1,6 @@
 import { sha256Hex } from '../utils/crypto';
 import { isSafeUpstreamUrl } from '../utils/urlsafe';
+import { applyDirective, emptyPlayOpts, type PlayOpts } from './playOpts';
 
 export interface ParsedChannel {
   id: string;
@@ -9,6 +10,7 @@ export interface ParsedChannel {
   tvgLogo: string;
   group: string;
   position: number;
+  playOpts: PlayOpts;
 }
 
 export interface ParseResult {
@@ -49,7 +51,7 @@ export async function parsePlaylist(text: string): Promise<ParseResult> {
   const categories: string[] = [];
   const catSeen = new Set<string>();
   let skipped = 0;
-  let pending: { name: string; attrs: Record<string, string> } | null = null;
+  let pending: { name: string; attrs: Record<string, string>; opts: PlayOpts } | null = null;
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
@@ -57,12 +59,18 @@ export async function parsePlaylist(text: string): Promise<ParseResult> {
     if (line.startsWith('#EXTINF')) {
       const comma = line.lastIndexOf(',');
       const name = (comma >= 0 ? line.slice(comma + 1) : '').trim();
-      pending = { name, attrs: parseAttrs(line) };
+      pending = { name, attrs: parseAttrs(line), opts: emptyPlayOpts() };
       continue;
     }
-    if (line.startsWith('#')) continue; // other directives (e.g. #EXTVLCOPT) are ignored
+    if (line.startsWith('#')) {
+      // Capture Kodi/VLC playback hints that sit between EXTINF and the URL.
+      if (pending && (line.startsWith('#EXTVLCOPT') || line.startsWith('#KODIPROP'))) {
+        applyDirective(pending.opts, line);
+      }
+      continue;
+    }
     if (!pending) continue; // URL without EXTINF
-    const { name, attrs } = pending;
+    const { name, attrs, opts } = pending;
     pending = null;
     if (!name || !isSafeUpstreamUrl(line)) {
       skipped++;
@@ -82,7 +90,7 @@ export async function parsePlaylist(text: string): Promise<ParseResult> {
       catSeen.add(group);
       categories.push(group);
     }
-    channels.push({ id, name, url, tvgId, tvgLogo, group, position: channels.length });
+    channels.push({ id, name, url, tvgId, tvgLogo, group, position: channels.length, playOpts: opts });
     if (channels.length > MAX_CHANNELS) throw new PlaylistError('too many channels');
   }
 
