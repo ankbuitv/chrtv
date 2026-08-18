@@ -7,14 +7,6 @@
 # Cập nhật ngày: 06/01
 # ==========================================
 
-# ---- Kênh cá nhân (link .m3u8 kèm ?token=…): token hết hạn thì thay link mới,
-# ---- sync 15 phút/lần (hoặc bấm Sync trong /admin) và xem ngay tại /xem ----
-#EXTINF:-1 tvg-id="sejp-playnow" group-title="Token - Link của tôi",SEJP (PlayNow)
-https://sg001-cdw18826playnow.ankb.qzz.io/copyrighted/api/stream/GETftplay/SEJP/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
-
-#EXTINF:-1 tvg-id="zhnj-playnow" group-title="Token - Link của tôi",ZHNj (PlayNow)
-https://sg001-cdw18826playnow.ankb.qzz.io/NotForCommercial/api/stream/GETnfcplay/ZHNj/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
-
 #EXTINF:-1 tvg-id="vietnam-today" tvg-logo="https://static.wikia.nocookie.net/logopedia/images/8/8c/VTV_Vietnam_Today_2023.png" group-title="TH - Truyền hình Việt",Vietnam Today
 https://live.fptplay53.net/fnxhd1/vntoday_vhls.smil/chunklist_b5000000.m3u8
 
@@ -330,7 +322,7 @@ http://chrtv.duckdns.org:30114/stream/hc
 
 
 #EXTINF:-1 tvg-id="hbo" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/d/de/HBO_logo.svg/1024px-HBO_logo.svg.png" group-title="🎬 BOX - Giải trí",HBO
-http://chrtv.duckdns.org:30211/hls/kenscom180/1080p.m3u8
+https://sg001-cdw18826playnow.ankb.qzz.io/copyrighted/api/stream/GETftplay/SEJP/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
 
 
 #EXTINF:-1 tvg-id="hbo-movies" tvg-logo="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTZ9ZkdwiuXS_zv7unMJpNdYB2QIJAZwAuyZW7uchKC9w&s" group-title="🎬 BOX - Giải trí",HBO Movies
@@ -346,22 +338,22 @@ http://chrtv.duckdns.org:30114/stream/wo
 http://chrtv.duckdns.org:30114/stream/warner
 
 #EXTINF:-1 tvg-id="cinemax" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/6/68/Cinemax_logo.svg/1024px-Cinemax_logo.svg.png" group-title="🎬 BOX - Giải trí",Cinemax USA
-http://chrtv.duckdns.org:30114/stream/USA_CINEMAX/index.m3u8
+https://sg001-cdw18826playnow.ankb.qzz.io/copyrighted/api/stream/GETftplay/Y2luZW1heA/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
 
 #EXTINF:-1 tvg-id="cinemaworld" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/6/68/Cinemax_logo.svg/1024px-Cinemax_logo.svg.png" group-title="🎬 BOX - Giải trí",Cinemaworld
 http://nmk.ioapk.com:5050/4gtv-live069/index.m3u8
 
 #EXTINF:-1 tvg-id="discovery" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/4/4b/Discovery_Channel_logo.svg/1024px-Discovery_Channel_logo.svg.png" group-title="🎬 BOX - Giải trí",Discovery Channel
-http://chrtv.duckdns.org:30114/stream/dsc
+https://sg001-cdw18826playnow.ankb.qzz.io/NotForCommercial/api/stream/GETnfcplay/ZHNj/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
 
 #EXTINF:-1 tvg-id="discovery-asia" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/4/4b/Discovery_Channel_logo.svg/1024px-Discovery_Channel_logo.svg.png" group-title="🎬 BOX - Giải trí",Discovery Asia
-http://chrtv.duckdns.org:30114/stream/asia
+https://sg001-cdw18826playnow.ankb.qzz.io/NotForCommercial/api/stream/GETnfcplay/YXNpYQ/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
 
 #EXTINF:-1 tvg-id="natgeo" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/f/fc/Nat_Geo_Channel_logo.svg/1024px-Nat_Geo_Channel_logo.svg.png" group-title="🎬 BOX - Giải trí",National Geographic
 #KODIPROP:inputstreamaddon=inputstream.adaptive
 #KODIPROP:inputstream.adaptive.manifest_type=hls
 #KODIPROP:inputstream.adaptive.stream_headers=X-Access-Token=5d3f72d76c010e308199f4116851004f2dfc638521c652ad
-http://chrtv.duckdns.org:30114/stream/USA_NAT_GEO/index.m3u8
+https://sg001-cdw18826playnow.ankb.qzz.io/red/api/stream/GETred/USA_NAT_GEO/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
 
 #EXTINF:-1 tvg-id="rakuten-tv" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/f/f7/Rakuten_TV_logo.svg/1024px-Rakuten_TV_logo.svg.png" group-title="🎬 BOX - Giải trí",Rakuten TV
 #EXTVLCOPT:http-user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0
@@ -377,20 +369,14 @@ https://devda.undo.it/Stream/index.php?id=davinci-tv&ext=.m3u8
 https://world.gscdn.kbs.co.kr/world-02/world-02_sd.m3u8?Policy=eyJTdGF0ZW1lbnQiOlt7IlJlc291cmNlIjoiaHR0cHM6Ly93b3JsZC5nc2Nkbi5rYnMuY28ua3Ivd29ybGQtMDIvKiIsIkNvbmRpdGlvbiI6eyJEYXRlTGVzc1RoYW4iOnsiQVdTOkVwb2NoVGltZSI6MTc4NzAxNDI2OX19fV19&Key-Pair-Id=APKAICDSGT3Y7IXGJ3TA&Signature=ICH7P4xKvCVGymcCm7TCdoyLOlstC~6KcHouAsSMgbXWp3xxG-gFxb~v33Qp-IJ0O-Nw8Opi7rlVN1yamRLQvD4xH3b2Q9m-~5x5iNqsolvHbJrRX1kC~n2WQ~jaV~XS6nraMw-u6UqyyOclBGkg6gJgTTMRIINf4A1Aat2CsCMbm0UcTUp2dbrgidlhQKvU2AV3wiZwNGVYynGbwps0Afz4My1Dj9q2EXg5UF62Y12v1zrso5baN1OS7F4g8i-quxKyB1QxhizrFMM4amIgzUSzOE~Lh6FXEjy0ej3MZMb2YWSnY1lM0qtlYKDcippF1knevpVI~RPLLhiakyq4RQ__
 
 #EXTINF:-1 tvg-id="MTV" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/0/0d/MTV_Logo_2021.svg/1024px-MTV_Logo_2021.svg.png" group-title="🎬 BOX - Giải trí",MTV
-#KODIPROP:inputstreamaddon=inputstream.adaptive
-#KODIPROP:inputstream.adaptive.manifest_type=hls
-#KODIPROP:inputstream.adaptive.stream_headers=X-Access-Token=5d3f72d76c010e308199f4116851004f2dfc638521c652ad
-http://chrtv.duckdns.org:30114/stream/USA_MTV/index.m3u8
+https://sg001-cdw18826playnow.ankb.qzz.io/red/api/stream/GETred/USA_MTV/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
 
 
 #EXTINF:-1 tvg-id="clubbing-tv" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/0/0d/MTV_Logo_2021.svg/1024px-MTV_Logo_2021.svg.png" group-title="🎬 BOX - Giải trí",Clubbing TV
 https://a-cdn.klowdtv.com/live3/clubbingtv_720p/playlist.m3u8
 
 #EXTINF:-1 tvg-id="crime-investigation" tvg-logo="https://upload.wikimedia.org/wikipedia/en/8/86/True_Crime_Network_logo.png" group-title="🎬 BOX - Giải trí",Crime Investigation
-#KODIPROP:inputstreamaddon=inputstream.adaptive
-#KODIPROP:inputstream.adaptive.manifest_type=hls
-#KODIPROP:inputstream.adaptive.stream_headers=X-Access-Token=5d3f72d76c010e308199f4116851004f2dfc638521c652ad
-http://chrtv.duckdns.org:30114/stream/USA_CRIME_INVESTIGATION/index.m3u8
+https://sg001-cdw18826playnow.ankb.qzz.io/red/api/stream/GETred/USA_CRIME_INVESTIGATION/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
 
 #EXTINF:-1 tvg-id="outdoor" group-title="🎬 BOX - Giải trí" tvg-logo="https://images.fptplay53.net/media/channels/icon_channel_outdoor-channel_165649323545.png", Outdoor Channel
 #EXTVLCOPT:http-user-agent=VThanhTivi
@@ -458,23 +444,20 @@ https://media-tyo.hls.nhkworld.jp/hls/w/live/master.m3u8
 #KODIPROP:inputstreamaddon=inputstream.adaptive
 #KODIPROP:inputstream.adaptive.manifest_type=hls
 #KODIPROP:inputstream.adaptive.stream_headers=X-Access-Token=5d3f72d76c010e308199f4116851004f2dfc638521c652ad
-http://chrtv.duckdns.org:30114/stream/USA_CARTOON_NETWORK/index.m3u8?token=5d3f72d76c010e308199f4116851004f2dfc638521c652ad
+https://sg001-cdw18826playnow.ankb.qzz.io/copyrighted/api/stream/GETftplay/Q04/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
 
 #EXTINF:-1 tvg-id="boomerang" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/c/c8/Boomerang_2014_logo.svg/1024px-Boomerang_2014_logo.svg.png" group-title="🎬 BOX - Giải trí",Boomerang
 #KODIPROP:inputstreamaddon=inputstream.adaptive
 #KODIPROP:inputstream.adaptive.manifest_type=hls
 #KODIPROP:inputstream.adaptive.stream_headers=X-Access-Token=5d3f72d76c010e308199f4116851004f2dfc638521c652ad
-http://chrtv.duckdns.org:30114/stream/USA_BOOMERANG/index.m3u8
+https://sg001-cdw18826playnow.ankb.qzz.io/red/api/stream/GETred/USA_BOOMERANG/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
 
 
 #EXTINF:-1 tvg-id="nick" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/5/52/Nickelodeon_2023_logo.svg/1024px-Nickelodeon_2023_logo.svg.png" group-title="🎬 BOX - Giải trí",Nickelodeon
-#KODIPROP:inputstreamaddon=inputstream.adaptive
-#KODIPROP:inputstream.adaptive.manifest_type=hls
-#KODIPROP:inputstream.adaptive.stream_headers=X-Access-Token=5d3f72d76c010e308199f4116851004f2dfc638521c652ad
-http://chrtv.duckdns.org:30114/stream/USA_NICKELODEON/index.m3u8
+http://nmk.ioapk.com:5050/4gtv-live105/index.m3u8
 
 #EXTINF:-1 tvg-id="dreamworks" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/DreamWorks_Animation_2016.svg/1024px-DreamWorks_Animation_2016.svg.png" group-title="🎬 BOX - Giải trí",Dreamworks HD
-http://chrtv.duckdns.org:30114/stream/dreamworks
+https://sg001-cdw18826playnow.ankb.qzz.io/NotForCommercial/api/stream/GETnfcplay/RHJlYW1Xb3Jrcw/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
 
 #EXTINF:-1 tvg-id="disney-xd" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/d/d3/Disney_XD_-_2015.svg/1024px-Disney_XD_-_2015.svg.png" group-title="🎬 BOX - Giải trí",Disney XD
 https://devda.undo.it/Stream/index.php?id=disney-xd&ext=.m3u8
@@ -527,6 +510,9 @@ https://sg001-cdw18826playnow.ankb.qzz.io/NotForCommercial/api/stream/GETnfcplay
 #EXTINF:-1 tvg-id="fpt-6" group-title="⚽ SPORTS - Thể thao" group-logo="https://toiyeuvietnam.dpdns.org/HoiQuanLogo/Images/HinhNhom.png" tvg-logo="https://toiyeuvietnam.dpdns.org/Logo/tv360-9/KenhCoBan.png",FPT Sự kiện 6
 https://sg001-cdw18826playnow.ankb.qzz.io/NotForCommercial/api/stream/GETnfcplay/ZnB0c2swNg/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
 
+#EXTINF:-1 tvg-id="tv360-9" group-title="⚽ SPORTS - Thể thao" group-logo="https://toiyeuvietnam.dpdns.org/HoiQuanLogo/Images/HinhNhom.png" tvg-logo="https://toiyeuvietnam.dpdns.org/Logo/tv360-9/KenhCoBan.png",TV360+ 9
+http://chrtv.duckdns.org:30106/hls/tv360_9/1080p.m3u8
+
 #EXTINF:-1 tvg-id="tv360-10" group-title="⚽ SPORTS - Thể thao" group-logo="https://toiyeuvietnam.dpdns.org/HoiQuanLogo/Images/HinhNhom.png" tvg-logo="https://toiyeuvietnam.dpdns.org/Logo/tv360-9/KenhCoBan.png",TV360+ 10
 http://chrtv.duckdns.org:30207/hls/tv360-10/1080p.m3u8
 
@@ -540,14 +526,3 @@ https://vmttv.dpdns.org/tv360/?id=tv360-11
 #KODIPROP:inputstream.adaptive.license_type=clearkey
 #KODIPROP:inputstream.adaptive.license_key=29b3e7c5de895bfa8850f16dad16e378:72a9e1be1d94ad66207f1ac61bcf7681
 https://vmttv.dpdns.org/tv360/?id=tv360-12
-
-
-#EXTINF:-1 tvg-id="spotv-2" group-title="⚽ SPORTS - Thể thao" , SpoTV1
-#EXTVLCOPT:http-user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)
-#EXTVLCOPT:http-referrer=https://thinkkast.dpdns.org/
-https://thinkkast.dpdns.org/thinkkast/cg_spotvhd/versiglia/index.m3u8
-
-#EXTINF:-1 tvg-id="spotv-2" group-title="⚽ SPORTS - Thể thao" , SpoTV1
-#EXTVLCOPT:http-user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)
-#EXTVLCOPT:http-referrer=https://thinkkast.dpdns.org/
-https://thinkkast.dpdns.org/thinkkast/dr_spotv2hd/versiglia/index.m3u8
