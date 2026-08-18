@@ -29,6 +29,11 @@ export default defineWorkersConfig(async () => {
               // lost" manifest is the baseline (wrangler.toml's real value
               // must not leak into the test worker).
               FALLBACK_M3U_URL: '',
+              // Pin the redirect mode explicitly: the strict-origin-hiding
+              // specs pass REDIRECT_UNSUPPORTED_PORTS: 'false' themselves,
+              // and the redirect specs rely on 'true' — this must not
+              // silently inherit the (operator-tunable) wrangler.toml value.
+              REDIRECT_UNSUPPORTED_PORTS: 'true',
             },
           },
         },

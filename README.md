@@ -367,14 +367,22 @@ Configuration in `wrangler.toml`:
   trap detection. Existing bans and brute-force protection still apply.
 - `HONEYPOT_BAN_SECONDS` — honeypot/brute-force ban duration, default `86400`
   (one day), minimum 60 seconds, clamped to a maximum of 7 days.
+- `REDIRECT_UNSUPPORTED_PORTS` — default `"true"`: an upstream on a port
+  Workers cannot fetch (e.g. DuckDNS on `:30113`) is served to the player as a
+  **302 redirect to the origin** instead of being skipped — players are
+  ordinary clients and can open any port, so the channel keeps playing even
+  though the Worker can't proxy it. Set `"false"` for strict origin hiding
+  (such channels fall back / fail closed and the origin is never disclosed).
 - `FALLBACK_M3U_URL` — (optional) HLS playlist served when a channel is dead.
   Supports **multiple comma-separated URLs**, tried in order:
   1. URL on a worker-fetchable port → CHRTV fetches and re-proxies it (segments
      become `/seg/{token}`), never exposing the fallback URL, works on https
      pages too.
-  2. URL on a port the worker **cannot** fetch (e.g. `:30113`) → skipped,
-     clients are never redirected to the raw origin.
-  3. No proxyable URL → the default empty "signal lost" manifest.
+  2. URL on a port the worker **cannot** fetch (e.g. `:30113`) → with
+     `REDIRECT_UNSUPPORTED_PORTS=true` it is served as a 302 redirect to its
+     origin; with `"false"` it is skipped and clients are never redirected to
+     the raw origin.
+  3. No usable URL → the default empty "signal lost" manifest.
 - `HEALTH_CHECK_BATCH` — (optional) channels probed per cron health sweep
   (`*/10 * * * *`). Always clamped to the hard cap of 12 (Free-plan subrequest
   budget — see Channel health); setting it higher doesn't sweep faster and can
@@ -391,22 +399,32 @@ silently rewritten to 80/443 or hangs until the timeout → players report
 | `http:`  | 80, 8080, 8880, 2052, 2082, 2086, 2095 |
 | `https:` | 443, 8443, 2053, 2083, 2087, 2096 |
 
-CHRTV validates before fetching and applies **strict origin hiding**:
+CHRTV validates before fetching. With `REDIRECT_UNSUPPORTED_PORTS=true`
+(default), a source on an unfetchable port keeps working via a **direct 302
+redirect to the origin** — the player (an ordinary client) can open any port,
+so it tunes in straight from the source:
 
-- A channel URL on an invalid port still only appears in the playlist as
-  `/hls/{token}`. After token + identity binding checks, the worker tries a
-  proxyable fallback; without one it returns a valid "signal lost" manifest.
-  The response never contains the raw origin or a `Location` pointing at it.
-- A child URI on an invalid port rejects the whole manifest before issuing any
-  child capability, then fails over / fails closed; no dead child URLs are ever
-  produced.
-- `FALLBACK_M3U_URL` on an invalid port (e.g. `:30113`) → candidate skipped, no
-  player redirect and no URL disclosure in the response.
+- A channel URL on an invalid port only appears in the playlist as
+  `/hls/{token}` (opaque). After token + identity binding checks, the worker
+  answers with `302 Location: <origin>` and the player connects directly. No
+  fallback fetch, no dead manifest.
+- A child URI inside a fetched manifest on an invalid port is left as its raw
+  origin URL in the rewritten manifest (only that URI bypasses the proxy —
+  fetchable siblings stay tokenized `/hls/` + `/seg/`).
+- `FALLBACK_M3U_URL` on an invalid port (e.g. `:30113`) → served as a 302
+  redirect to that origin.
 
-Custom-port sources must sit behind **HTTPS port 443**, go through a
-**Cloudflare Tunnel**, or use a **private relay** on a worker-fetchable port.
-CHRTV doesn't use User-Agent/camouflage to hide the origin from scanners only:
-the same non-disclosure rules apply to curl, players and browsers alike.
+With `REDIRECT_UNSUPPORTED_PORTS=false`, **strict origin hiding** applies
+instead: invalid-port channels fail over to a proxyable fallback / the "signal
+lost" manifest, invalid-port child URIs reject the whole manifest, and
+invalid-port fallback candidates are skipped — the origin is never disclosed in
+any response.
+
+Keep in mind a redirected stream bypasses the CHRTV proxy: the player talks to
+the origin directly, so CHRTV can't re-rewrite child URIs, cache segments, or
+hide that origin from viewers of that channel. For fully proxied playback,
+custom-port sources should still sit behind **HTTPS port 443**, a
+**Cloudflare Tunnel**, or a **private relay** on a worker-fetchable port.
 
 ### Fighting "connection is unstable"
 

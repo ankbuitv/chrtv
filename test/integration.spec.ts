@@ -3,7 +3,7 @@ import { SELF, env, fetchMock } from 'cloudflare:test';
 import { createToken, verifyToken } from '../src/token';
 import { syncPlaylist } from '../src/playlist/sync';
 import { probeChannel, healthCheckBatch, MAX_PROBES_PER_RUN } from '../src/playlist/health';
-import { handleHlsManifest } from '../src/proxy/handlers';
+import { handleHlsManifest, handleSegment } from '../src/proxy/handlers';
 import { handleSessionPlaylist } from '../src/auth/loginApi';
 import { hashPassword, hmacHex, randomHex } from '../src/utils/crypto';
 
@@ -552,7 +552,7 @@ describe('/tv.m3u playlist', () => {
     expect(event).toEqual({ username: '', event_type: 'playlist', route: '/tv.m3u', outcome: 'success', ip_address: ip });
   });
 
-  it('keeps custom-port channels opaque and never reveals their origin in a redirect', async () => {
+  it('keeps custom-port channels opaque in the M3U but redirects the player to the origin', async () => {
     await seedChannels();
     const now = Math.floor(Date.now() / 1000);
     const upstream = 'http://chrtv.duckdns.org:4000/hls/hbo/master.m3u8';
@@ -576,15 +576,13 @@ describe('/tv.m3u playlist', () => {
     expect(verdict.ok).toBe(true);
     if (verdict.ok) expect(verdict.payload.u).toBe(upstream);
 
-    // Workers cannot fetch this port. Even after token authentication, CHRTV
-    // fails closed to a valid error manifest and never returns the raw origin.
+    // Workers cannot fetch this port, but with REDIRECT_UNSUPPORTED_PORTS
+    // enabled CHRTV sends the player straight to the origin (ordinary clients
+    // can open any port) instead of skipping the channel.
     const stream = await SELF.fetch(tokenUrl, { redirect: 'manual' });
-    expect(stream.status).toBe(200);
-    expect(stream.headers.get('Location')).toBeNull();
-    expect(stream.headers.get('X-CHRTV-Fallback')).toBe('1');
+    expect(stream.status).toBe(302);
+    expect(stream.headers.get('Location')).toBe(upstream);
     const streamBody = await stream.text();
-    expect(streamBody).toContain('#EXT-X-ENDLIST');
-    expect(streamBody).not.toContain(upstream);
     expect(streamBody).not.toContain('chrtv.duckdns.org');
   });
 
@@ -1267,7 +1265,7 @@ describe('HLS proxy', () => {
     const token = await mintToken(primary, { channel: 'strictfallback01x' });
     const res = await handleHlsManifest(
       new Request(`${BASE}/hls/${token}.m3u8`),
-      { ...env, FALLBACK_M3U_URL: 'https://strict-fallback.example.com/index.m3u8' },
+      { ...env, FALLBACK_M3U_URL: 'https://strict-fallback.example.com/index.m3u8', REDIRECT_UNSUPPORTED_PORTS: 'false' },
       'req-strict-primary-fallback',
       token,
     );
@@ -1279,6 +1277,36 @@ describe('HLS proxy', () => {
     expect(body).not.toContain(primary);
     expect(body).not.toContain('origin.example.com');
     expect(body).not.toContain('strict-fallback.example.com');
+  });
+
+  it('redirects an unsupported-port primary straight to its origin when enabled', async () => {
+    const primary = 'http://chrtv.duckdns.org:30113/live/index.m3u8';
+    const token = await mintToken(primary, { channel: 'redirectchannel01x' });
+    const res = await handleHlsManifest(
+      new Request(`${BASE}/hls/${token}.m3u8`),
+      { ...env, REDIRECT_UNSUPPORTED_PORTS: 'true' },
+      'req-redirect-primary',
+      token,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe(primary);
+    expect(res.headers.get('X-CHRTV-Fallback')).toBeNull();
+    const body = await res.text();
+    expect(body).toBe('');
+  });
+
+  it('redirects an unsupported-port fallback candidate to its origin when enabled', async () => {
+    fetchMock.get('https://dead-primary.example.com').intercept({ path: '/gone.m3u8' }).reply(404, 'not found');
+    const fallbackOrigin = 'http://chrtv.duckdns.org:30113/hls/index.m3u8';
+    const token = await mintToken('https://dead-primary.example.com/gone.m3u8', { channel: 'redirectfbchannel01x' });
+    const res = await handleHlsManifest(
+      new Request(`${BASE}/hls/${token}.m3u8`),
+      { ...env, FALLBACK_M3U_URL: fallbackOrigin, REDIRECT_UNSUPPORTED_PORTS: 'true' },
+      'req-redirect-fallback',
+      token,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe(fallbackOrigin);
   });
 
   it('does not extend fallback descendant capabilities beyond the parent expiry', async () => {
@@ -1309,7 +1337,7 @@ describe('HLS proxy', () => {
     const token = await mintToken('https://deadport.example.com/gone.m3u8', { channel: 'portchannel0001x' });
     const res = await handleHlsManifest(
       new Request(`${BASE}/hls/${token}.m3u8`),
-      { ...env, FALLBACK_M3U_URL: 'http://chrtv.duckdns.org:30113/hls/index.m3u8' },
+      { ...env, FALLBACK_M3U_URL: 'http://chrtv.duckdns.org:30113/hls/index.m3u8', REDIRECT_UNSUPPORTED_PORTS: 'false' },
       'req-fallback-redirect',
       token,
     );
@@ -1333,6 +1361,7 @@ describe('HLS proxy', () => {
       {
         ...env,
         FALLBACK_M3U_URL: 'https://fb2.example.com/hls/index.m3u8, http://chrtv.duckdns.org:30113/hls/index.m3u8',
+        REDIRECT_UNSUPPORTED_PORTS: 'false',
       },
       'req-fallback-multi',
       token,
@@ -1354,6 +1383,7 @@ describe('HLS proxy', () => {
       {
         ...env,
         FALLBACK_M3U_URL: 'https://fb3.example.com/hls/index.m3u8 http://chrtv.duckdns.org:30113/hls/index.m3u8',
+        REDIRECT_UNSUPPORTED_PORTS: 'false',
       },
       'req-fallback-chain',
       token,
@@ -1425,7 +1455,7 @@ describe('HLS proxy', () => {
     expect(notFound.status).toBe(404);
   });
 
-  it('/live/{user}/{pass}/{id}.m3u8 keeps custom-port channel origins hidden', async () => {
+  it('/live/{user}/{pass}/{id}.m3u8 redirects custom-port channels to their origin', async () => {
     await seedChannels();
     const now = Math.floor(Date.now() / 1000);
     await env.DB.prepare(
@@ -1439,12 +1469,12 @@ describe('HLS proxy', () => {
     const opaque = res.headers.get('Location')!;
     expect(opaque).toMatch(/^https:\/\/chrtv\.example\.com\/hls\/.+\.m3u8$/);
     const stream = await SELF.fetch(opaque, { redirect: 'manual' });
-    expect(stream.status).toBe(200);
-    expect(stream.headers.get('Location')).toBeNull();
+    // Custom port => the Worker cannot proxy it, so the player is redirected
+    // straight to the origin instead of being served a dead fallback.
+    expect(stream.status).toBe(302);
+    expect(stream.headers.get('Location')).toBe('http://chrtv.duckdns.org:18483/stream/cg_hbofam/index.m3u8');
     const body = await stream.text();
-    expect(body).toContain('#EXT-X-ENDLIST');
     expect(body).not.toContain('chrtv.duckdns.org');
-    expect(body).not.toContain(':18483');
   });
 });
 
@@ -1489,11 +1519,27 @@ describe('media segment proxy', () => {
     expect(res.headers.get('Content-Type')).toContain('json');
   });
 
-  it('fails closed for unsupported-port media without a raw Location header', async () => {
+  it('redirects unsupported-port media straight to the origin when enabled', async () => {
     const upstream = 'http://origin.example.com:30113/media/segment.ts';
     const now = Math.floor(Date.now() / 1000);
     const token = await createToken(env.SECRET_KEY, { u: upstream, iat: now, exp: now + 300, k: 's' });
     const res = await SELF.fetch(`${BASE}/seg/${token}.ts`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe(upstream);
+    const body = await res.text();
+    expect(body).not.toContain('origin.example.com');
+  });
+
+  it('fails closed for unsupported-port media without a raw Location header in strict mode', async () => {
+    const upstream = 'http://origin.example.com:30113/media/segment.ts';
+    const now = Math.floor(Date.now() / 1000);
+    const token = await createToken(env.SECRET_KEY, { u: upstream, iat: now, exp: now + 300, k: 's' });
+    const res = await handleSegment(
+      new Request(`${BASE}/seg/${token}.ts`),
+      { ...env, REDIRECT_UNSUPPORTED_PORTS: 'false' },
+      'req-strict-segment-port',
+      token,
+    );
     expect(res.status).toBe(502);
     expect(res.headers.get('Location')).toBeNull();
     const body = await res.text();
