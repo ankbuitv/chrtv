@@ -19,7 +19,7 @@ migrations_dir = "migrations"
 
 [vars]
 # Source of truth: the M3U in this GitHub repository (raw URL).
-PLAYLIST_URL = "https://raw.githubusercontent.com/ankbuitv/mytv/refs/heads/main/playlist.m3u"
+PLAYLIST_URL = "https://raw.githubusercontent.com/ankbuitv/chrtv/refs/heads/main/playlists/tv.m3u"
 # Optional XMLTV EPG source. Leave empty to serve a minimal valid XMLTV document.
 EPG_URL = "https://epg.io.vn/epgc.xml"
 # "true" => only /tv.m3u and /xem.m3u work without an access key (streams and
