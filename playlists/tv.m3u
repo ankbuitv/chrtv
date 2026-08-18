@@ -331,6 +331,10 @@ https://sg001-cdw18826playnow.ankb.qzz.io/copyrighted/api/stream/GETftplay/SEJP/
 #KODIPROP:inputstream.adaptive.stream_headers=X-Access-Token=5d3f72d76c010e308199f4116851004f2dfc638521c652ad
 http://chrtv.duckdns.org:4000/hls/hbo/master.m3u8
 
+#EXTINF:-1 tvg-id="axn" tvg-logo="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTZ9ZkdwiuXS_zv7unMJpNdYB2QIJAZwAuyZW7uchKC9w&s" group-title="🎬 BOX - Giải trí",AXN
+https://sg001-cdw18826playnow.ankb.qzz.io/ph/api/stream/GETphplay/YXhu/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
+
+
 #EXTINF:-1 tvg-id="woman" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/6/68/Warner_TV.svg/1024px-Warner_TV.svg.png" group-title="🎬 BOX - Giải trí",Woman
 http://chrtv.duckdns.org:30114/stream/wo
 
