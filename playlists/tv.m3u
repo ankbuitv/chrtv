@@ -339,7 +339,7 @@ https://sg001-cdw18826playnow.ankb.qzz.io/ph/api/stream/GETphplay/YXhu/index.m3u
 http://chrtv.duckdns.org:30114/stream/wo
 
 #EXTINF:-1 tvg-id="warner" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/6/68/Warner_TV.svg/1024px-Warner_TV.svg.png" group-title="🎬 BOX - Giải trí",Warner TV
-http://chrtv.duckdns.org:30114/stream/warner
+https://sg001-cdw18826playnow.ankb.qzz.io/NotForCommercial/api/stream/GETnfcplay/d2FybmVydHY/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
 
 #EXTINF:-1 tvg-id="cinemax" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/6/68/Cinemax_logo.svg/1024px-Cinemax_logo.svg.png" group-title="🎬 BOX - Giải trí",Cinemax USA
 https://sg001-cdw18826playnow.ankb.qzz.io/copyrighted/api/stream/GETftplay/Y2luZW1heA/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
