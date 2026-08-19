@@ -179,6 +179,8 @@ export interface RewriteOptions {
   binding?: TokenBinding;
   /** Channel id inherited for circuit-breaker/failure attribution. */
   channelId?: string;
+  /** Rolling viewer-list lease inherited by descendant manifests. */
+  leaseId?: string;
   /** Parent capability boundary; descendants must never outlive it. */
   absoluteExpiry?: number;
   now?: number;
@@ -194,6 +196,7 @@ function mintOpts(opts: RewriteOptions): MintOptions {
     publicOrigin: opts.publicOrigin,
     binding: opts.binding,
     ...(opts.channelId ? { channelId: opts.channelId } : {}),
+    ...(opts.leaseId ? { leaseId: opts.leaseId } : {}),
     ...(opts.absoluteExpiry !== undefined ? { absoluteExpiry: opts.absoluteExpiry } : {}),
     ...(opts.now !== undefined ? { now: opts.now } : {}),
     ...(opts.rf ? { rf: opts.rf } : {}),

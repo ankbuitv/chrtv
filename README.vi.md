@@ -66,6 +66,7 @@ GitHub M3U (playlists/tv.m3u)
 ```
 
 - **Token**: AES-256-GCM, chứa upstream URL + iat/exp và identity đã xác thực (`MAC`, `user_id`, `access_key_id`, `session_id` khi có), tamper-proof, tự hết hạn. Token con trong manifest kế thừa cùng identity; khi bật claim `ip`, token lấy từ IP khác bị chặn `403 TOKEN_BINDING_MISMATCH`. Mỗi lần tải manifest/EPG còn kiểm tra lại trạng thái user/key/session để revoke có hiệu lực trước khi chạm upstream. Upstream URL không xuất hiện trong playlist.
+- **Rolling list theo người xem**: link playlist `/p/{session}.m3u` vẫn cố định, còn toàn bộ URL kênh bên trong gắn với một lease riêng được nhận diện bằng user/session/MAC/access-key cùng IP và User-Agent đã HMAC (không lưu username/IP thô trong bảng lease). Trong lúc player còn refresh manifest, tải lại list vẫn nhận đúng URL cũ để không mất buffer. Sau **60 giây không còn request manifest**, generation cũ hết hiệu lực; lần tải list kế tiếp tự sinh URL kênh mới và URL cũ trả `410 TOKEN_EXPIRED`. IP chỉ dùng tách viewer lease, không khóa cứng playback khi `TOKEN_BINDING` không chứa `ip`, nên đổi IP/CGNAT không cắt stream đang chạy.
 - **SSRF guard**: chỉ http/https public; chặn localhost, private IP, link-local, metadata endpoints — kiểm tra cả từng hop redirect.
 - **Circuit breaker**: upstream fail → failure state TTL 30s trong Cloudflare Cache; trong TTL trả ngay fallback manifest, hết TTL tự retry.
 - **Proxy lồng (PHP/portal → m3u8 khác)**: nhiều nguồn trả một M3U 1 dòng trỏ sang playlist thật, hoặc chỉ echo URL. CHRTV tự follow (tối đa 2 hop), rồi mới rewrite — player không bao giờ nhận wrapper để đem đi demux như MPEG-TS.
@@ -336,7 +337,7 @@ npm install
 # 1. Tạo D1 database, điền database_id vào wrangler.toml
 npx wrangler d1 create chrtv-db
 
-# 2. Chạy migrations (bao gồm 0005 token identity, 0006 bans, 0007 sessions/audit)
+# 2. Chạy migrations (bao gồm 0005–0009: token identity, bans, sessions/audit, play_opts, viewer lease)
 npm run db:migrate          # remote
 npm run db:migrate:local    # local dev
 

@@ -3,6 +3,7 @@ import { listActiveChannels } from '../db/channels';
 import { createToken, TOKEN_STABILITY_WINDOW, tokenBindingSeed, type TokenBinding } from '../token';
 import { getSetting } from '../db/settings';
 import { parsePlayOpts, resolvedKind, tokenHintsFromPlayOpts } from './playOpts';
+import { getViewerLease } from './viewLease';
 
 const DEFAULT_PLAYLIST_TOKEN_TTL = 30 * 24 * 60 * 60; // 30 days
 
@@ -49,17 +50,21 @@ export async function buildChannelEntries(
   origin: string,
   binding: TokenBinding = {},
   absoluteExpiry?: number | null,
+  req?: Request,
 ): Promise<ChannelEntries> {
   const channels = await listActiveChannels(env.DB);
+  const viewerLease = req ? await getViewerLease(req, env, binding) : undefined;
   const ttlSetting = Number(await getSetting(env.DB, 'playlist_token_ttl'));
   const ttl = Number.isFinite(ttlSetting) && ttlSetting > 60 ? ttlSetting : DEFAULT_PLAYLIST_TOKEN_TTL;
   const now = Math.floor(Date.now() / 1000);
 
-  // Quantized issue time + deterministic IV: refetching the playlist yields the
-  // SAME channel URLs for the same client identity, so players keep their
-  // channel mapping/EPG bindings. The binding is part of both plaintext and IV
-  // seed, making tokens different across IP/MAC/user/access-key identities.
-  const iat = Math.floor(now / TOKEN_STABILITY_WINDOW) * TOKEN_STABILITY_WINDOW;
+  // Lease-pinned (or legacy quantized) issue time + deterministic IV:
+  // refetching the playlist while playback is active yields the SAME channel
+  // URLs. The binding is part of plaintext and the IV seed, and the rolling
+  // lease changes every URL after the viewer has been idle.
+  // Pin issue time to the viewer generation so a playlist remains byte-stable
+  // across ordinary 10-minute token buckets for as long as playback is active.
+  const iat = viewerLease?.issuedAt ?? Math.floor(now / TOKEN_STABILITY_WINDOW) * TOKEN_STABILITY_WINDOW;
   const bindingSeed = tokenBindingSeed(binding);
   const configuredExp = iat + ttl;
   // Authenticated playlist capabilities must never outlive their account/key.
@@ -82,8 +87,8 @@ export async function buildChannelEntries(
       const hints = tokenHintsFromPlayOpts(ch.play_opts, ch.url);
       return createToken(
         env.SECRET_KEY,
-        { u: ch.url, iat, exp, k: 'm', c: ch.id, ...binding, ...hints },
-        `ch|${iat}|${exp}|${ch.id}|${ch.url}|${bindingSeed}`,
+        { u: ch.url, iat, exp, k: 'm', c: ch.id, ...binding, ...(viewerLease ? { l: viewerLease.id } : {}), ...hints },
+        `ch|${iat}|${exp}|${ch.id}|${ch.url}|${bindingSeed}|${viewerLease?.id ?? ''}`,
       );
     }),
   );
@@ -117,8 +122,9 @@ export async function buildPlaylist(
   origin: string,
   binding: TokenBinding = {},
   absoluteExpiry?: number | null,
+  req?: Request,
 ): Promise<string> {
-  const { entries, epgUrl } = await buildChannelEntries(env, origin, binding, absoluteExpiry);
+  const { entries, epgUrl } = await buildChannelEntries(env, origin, binding, absoluteExpiry, req);
   const lines: string[] = [`#EXTM3U url-tvg="${epgUrl}" x-tvg-url="${epgUrl}"`];
 
   for (const ch of entries) {

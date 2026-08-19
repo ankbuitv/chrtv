@@ -44,6 +44,8 @@ export interface TokenPayload extends TokenBinding {
   k?: 'm' | 's' | 'e' | 'b';
   /** Channel id (set on channel and descendant manifest/media tokens) */
   c?: string;
+  /** Rolling viewer-list lease generation (opaque, encrypted). */
+  l?: string;
   /** Referer to send upstream (encrypted). Inherited by descendant tokens. */
   rf?: string;
   /** User-Agent override to send upstream (encrypted). */
@@ -194,6 +196,7 @@ export type TokenResult =
 function validOptionalClaims(payload: TokenPayload): boolean {
   if (payload.k !== undefined && payload.k !== 'm' && payload.k !== 's' && payload.k !== 'e' && payload.k !== 'b') return false;
   if (payload.c !== undefined && (typeof payload.c !== 'string' || payload.c.length > 128)) return false;
+  if (payload.l !== undefined && (typeof payload.l !== 'string' || !/^[a-f0-9]{32}$/.test(payload.l))) return false;
   if (payload.ip !== undefined && (typeof payload.ip !== 'string' || payload.ip.length > 64 || !/^[0-9a-f:.]+$/i.test(payload.ip))) {
     return false;
   }

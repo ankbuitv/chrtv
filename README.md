@@ -74,6 +74,14 @@ GitHub M3U (playlists/tv.m3u)
   the same identity. User/key/session state is re-checked on every manifest/EPG
   load, so a revoke takes effect before the worker ever touches the upstream.
   Upstream URLs never appear in the playlist.
+- **Per-viewer rolling lists**: the user-facing `/p/{session}.m3u` stays stable,
+  while its channel URLs belong to a generation identified by user/session,
+  MAC/access-key and an HMAC-protected IP/User-Agent identity. Manifest
+  heartbeats keep that generation byte-stable during playback. After 60 seconds
+  without a manifest request, the old generation expires; the next playlist
+  fetch gets new channel URLs and abandoned URLs return `410 TOKEN_EXPIRED`.
+  IP separates viewer leases without hard-locking playback unless `ip` is also
+  explicitly enabled in `TOKEN_BINDING`.
 - **SSRF guard**: only public http(s); localhost, private IPs, link-local and
   metadata endpoints are blocked — including on every redirect hop.
 - **Circuit breaker**: upstream failure → 30s failure state in the Cloudflare
@@ -381,7 +389,7 @@ npm install
 # 1. Create the D1 database and fill in database_id in wrangler.toml
 npx wrangler d1 create chrtv-db
 
-# 2. Run migrations (includes 0005–0008: identity, bans, sessions/audit, play_opts)
+# 2. Run migrations (includes 0005–0009: identity, bans, sessions/audit, play_opts, viewer leases)
 npm run db:migrate          # remote
 npm run db:migrate:local    # local dev
 

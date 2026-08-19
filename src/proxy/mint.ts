@@ -27,6 +27,8 @@ export interface MintOptions {
   publicOrigin: string;
   binding?: TokenBinding;
   channelId?: string;
+  /** Rolling viewer-list lease inherited by all descendant manifest tokens. */
+  leaseId?: string;
   absoluteExpiry?: number;
   now?: number;
   /** Inherited upstream request hints (Referer / UA / extra headers). */
@@ -67,6 +69,7 @@ export async function mintProxyUrl(opts: MintOptions, upstream: string, kind: Pr
     exp,
     k: kind === 'b' ? 'b' : kind,
     ...(opts.channelId ? { c: opts.channelId } : {}),
+    ...(opts.leaseId ? { l: opts.leaseId } : {}),
     ...binding,
     ...(opts.rf ? { rf: opts.rf } : {}),
     ...(opts.ua ? { ua: opts.ua } : {}),
@@ -75,7 +78,7 @@ export async function mintProxyUrl(opts: MintOptions, upstream: string, kind: Pr
   const token = await createToken(
     opts.secret,
     payload,
-    `${kind}|${iat}|${exp}|${upstream}|${opts.channelId ?? ''}|${tokenBindingSeed(binding)}|${opts.rf ?? ''}|${opts.ua ?? ''}|${opts.xh ?? ''}`,
+    `${kind}|${iat}|${exp}|${upstream}|${opts.channelId ?? ''}|${opts.leaseId ?? ''}|${tokenBindingSeed(binding)}|${opts.rf ?? ''}|${opts.ua ?? ''}|${opts.xh ?? ''}`,
   );
   if (kind === 'b') return `${opts.publicOrigin}/dseg/${token}/`;
   if (kind === 'm') {

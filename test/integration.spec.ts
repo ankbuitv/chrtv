@@ -552,6 +552,42 @@ describe('/tv.m3u playlist', () => {
     expect(event).toEqual({ username: '', event_type: 'playlist', route: '/tv.m3u', outcome: 'success', ip_address: ip });
   });
 
+  it('keeps a viewer list stable while active and rotates it after 60 seconds idle', async () => {
+    await seedChannels();
+    const headers = { 'CF-Connecting-IP': '192.0.2.88', 'User-Agent': 'Rolling-IPTV/1.0' };
+    const channelUrl = (body: string) => body.split('\n').find((line) => line.includes('/hls/'))!;
+    const rawToken = (url: string) => url.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+
+    const first = channelUrl(await (await SELF.fetch(`${BASE}/tv.m3u`, { headers })).text());
+    const again = channelUrl(await (await SELF.fetch(`${BASE}/tv.m3u`, { headers })).text());
+    expect(again).toBe(first);
+
+    const firstVerdict = await verifyToken(env.SECRET_KEY, rawToken(first));
+    expect(firstVerdict.ok).toBe(true);
+    if (!firstVerdict.ok) return;
+    expect(firstVerdict.payload.l).toMatch(/^[a-f0-9]{32}$/);
+
+    // Simulate a player that had activated this generation and then stopped
+    // requesting manifests for longer than the selected one-minute grace.
+    const now = Math.floor(Date.now() / 1000);
+    await env.DB.prepare(
+      'UPDATE viewer_leases SET activated_at = ?, last_seen = ?, updated_at = ? WHERE lease_id = ?',
+    )
+      .bind(now - 120, now - 61, now - 61, firstVerdict.payload.l)
+      .run();
+
+    const rotated = channelUrl(await (await SELF.fetch(`${BASE}/tv.m3u`, { headers })).text());
+    expect(rotated).not.toBe(first);
+    const rotatedVerdict = await verifyToken(env.SECRET_KEY, rawToken(rotated));
+    expect(rotatedVerdict.ok).toBe(true);
+    if (rotatedVerdict.ok) expect(rotatedVerdict.payload.l).not.toBe(firstVerdict.payload.l);
+
+    // A copied URL from the abandoned list cannot restart playback.
+    const stale = await SELF.fetch(first, { headers });
+    expect(stale.status).toBe(410);
+    expect(((await stale.json()) as { error: string }).error).toBe('TOKEN_EXPIRED');
+  });
+
   it('keeps custom-port channels opaque and never reveals their origin in a redirect', async () => {
     await seedChannels();
     const now = Math.floor(Date.now() / 1000);

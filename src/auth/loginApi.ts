@@ -147,7 +147,7 @@ export async function handleSessionPlaylist(
     (value): value is number => value !== null && Number.isFinite(value) && value > 0,
   );
   const effectiveExpiry = expiryCandidates.length > 0 ? Math.min(...expiryCandidates) : null;
-  const body = await buildPlaylist(env, url.origin, binding, effectiveExpiry);
+  const body = await buildPlaylist(env, url.origin, binding, effectiveExpiry, req);
   return privateResponse(playlistResponse(body, requestId, req.method === 'HEAD'));
 }
 

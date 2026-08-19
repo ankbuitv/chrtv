@@ -19,6 +19,7 @@ import { errorMpdResponse } from '../dash/errorMpd';
 import { getFailure, setFailure, recordFailure } from './failureCache';
 import { sha256Hex } from '../utils/crypto';
 import { isTokenAuthorizationActive } from '../auth/tokenAuthorization';
+import { touchViewerLease } from '../playlist/viewLease';
 
 /**
  * Stream proxy handlers.
@@ -60,6 +61,7 @@ function rewriteOpts(
     publicOrigin: new URL(req.url).origin,
     binding,
     ...(payload.c ? { channelId: payload.c } : {}),
+    ...(payload.l ? { leaseId: payload.l } : {}),
     absoluteExpiry: payload.exp,
     ...hints,
   };
@@ -254,6 +256,10 @@ async function handleManifest(
   if (!requestMatchesTokenBinding(req, payload)) {
     logEvent(requestId, preferMpd ? '/mpd' : '/hls', ErrorCodes.TOKEN_BINDING_MISMATCH);
     return errorResponse(ErrorCodes.TOKEN_BINDING_MISMATCH, 403, requestId);
+  }
+  if (!(await touchViewerLease(env, payload))) {
+    logEvent(requestId, preferMpd ? '/mpd' : '/hls', ErrorCodes.TOKEN_EXPIRED, 'viewer lease idle or rotated');
+    return errorResponse(ErrorCodes.TOKEN_EXPIRED, 410, requestId);
   }
   if (!(await isTokenAuthorizationActive(env, payload))) {
     logEvent(requestId, preferMpd ? '/mpd' : '/hls', ErrorCodes.AUTH_DISABLED, 'revoked or expired token identity');
