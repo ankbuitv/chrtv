@@ -78,10 +78,16 @@ GitHub M3U (playlists/tv.m3u)
   while its channel URLs belong to a generation identified by user/session,
   MAC/access-key and an HMAC-protected IP/User-Agent identity. Manifest
   heartbeats keep that generation byte-stable during playback. After 60 seconds
-  without a manifest request, the old generation expires; the next playlist
-  fetch gets new channel URLs and abandoned URLs return `410 TOKEN_EXPIRED`.
-  IP separates viewer leases without hard-locking playback unless `ip` is also
-  explicitly enabled in `TOKEN_BINDING`.
+  without a manifest request the next playlist fetch rotates the generation and
+  issues fresh channel URLs; the abandoned URLs then return `410 TOKEN_EXPIRED`.
+  A player that merely resumes after 60+ seconds of silence (pause, seek,
+  network stall) revives its own generation instead of being rotated away, so
+  playback never dies from a pause. The built-in `/xem` web player (hls.js)
+  additionally detects a `410`/`403` and transparently re-mints the channel
+  link. If the `viewer_leases` D1 table is unavailable (e.g. migration not yet
+  applied), the playlist degrades to legacy lease-less tokens instead of
+  failing. IP separates viewer leases without hard-locking playback unless
+  `ip` is also explicitly enabled in `TOKEN_BINDING`.
 - **SSRF guard**: only public http(s); localhost, private IPs, link-local and
   metadata endpoints are blocked — including on every redirect hop.
 - **Circuit breaker**: upstream failure → 30s failure state in the Cloudflare
