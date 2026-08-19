@@ -588,6 +588,129 @@ describe('/tv.m3u playlist', () => {
     expect(((await stale.json()) as { error: string }).error).toBe('TOKEN_EXPIRED');
   });
 
+  it('revives the same generation when a player resumes after 60+ seconds of silence', async () => {
+    await seedChannels();
+    const headers = { 'CF-Connecting-IP': '203.0.113.44', 'User-Agent': 'Mozilla/5.0 Chrome/126' };
+
+    const master = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:3',
+      '#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=1280x720',
+      'chunklist.m3u8',
+    ].join('\n');
+    const chunklist = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:3',
+      '#EXT-X-TARGETDURATION:2',
+      '#EXT-X-MEDIA-SEQUENCE:0',
+      '#EXTINF:2.0,',
+      'seg0.ts',
+      '#EXTINF:2.0,',
+      'seg1.ts',
+    ].join('\n');
+    fetchMock
+      .get('https://up.example.com')
+      .intercept({ path: '/live/vtv1/index.m3u8' })
+      .reply(200, master, { headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } })
+      .persist();
+    fetchMock
+      .get('https://up.example.com')
+      .intercept({ path: '/live/vtv1/chunklist.m3u8' })
+      .reply(200, chunklist, { headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } })
+      .persist();
+    fetchMock.get('https://up.example.com').intercept({ path: '/live/vtv1/seg0.ts' }).reply(200, 'TSDATA0');
+
+    // The web player fetches the channel grid, then hls.js loads master →
+    // media playlist → segment, exactly like a browser session.
+    const grid = await SELF.fetch(`${BASE}/api/channels`, { headers });
+    expect(grid.status).toBe(200);
+    const channels = ((await grid.json()) as { channels: Array<{ url: string }> }).channels;
+    const channelUrl = channels[0]!.url;
+    const channelToken = channelUrl.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+    const channelVerdict = await verifyToken(env.SECRET_KEY, channelToken);
+    expect(channelVerdict.ok).toBe(true);
+    if (!channelVerdict.ok) return;
+    const leaseId = channelVerdict.payload.l!;
+
+    const masterRes = await SELF.fetch(channelUrl, { headers });
+    expect(masterRes.status).toBe(200);
+    const masterBody = await masterRes.text();
+    expect(masterBody).toContain(`${BASE}/hls/`);
+    const variantUrl = masterBody.split('\n').find((line) => line.includes(`${BASE}/hls/`))!;
+
+    const variantRes = await SELF.fetch(variantUrl, { headers });
+    expect(variantRes.status).toBe(200);
+    const variantBody = await variantRes.text();
+    expect(variantBody).toContain(`${BASE}/seg/`);
+    const segUrl = variantBody.split('\n').find((line) => line.includes(`${BASE}/seg/`))!;
+    expect((await SELF.fetch(segUrl, { headers })).status).toBe(200);
+
+    // The viewer pauses (or the network stalls) for 70 seconds, then hits
+    // play. hls.js re-requests the media playlist to catch up with the live
+    // edge. Playback must resume — the old code rotated the generation here
+    // and answered 410, which hls.js cannot recover from.
+    const now = Math.floor(Date.now() / 1000);
+    await env.DB.prepare('UPDATE viewer_leases SET last_seen = ?, updated_at = ? WHERE lease_id = ?')
+      .bind(now - 70, now - 70, leaseId)
+      .run();
+
+    const resumed = await SELF.fetch(variantUrl, { headers });
+    expect(resumed.status).toBe(200);
+    expect(await resumed.text()).toContain(`${BASE}/seg/`);
+
+    // Same generation: nothing was rotated, so a playlist re-fetch keeps the
+    // byte-identical channel URLs the player is already using.
+    const again = await SELF.fetch(`${BASE}/api/channels`, { headers });
+    expect(((await again.json()) as { channels: Array<{ url: string }> }).channels[0]!.url).toBe(channelUrl);
+    const lease = await env.DB.prepare('SELECT lease_id FROM viewer_leases WHERE lease_id = ?').bind(leaseId).first();
+    expect(lease).toBeTruthy();
+  });
+
+  it('degrades to legacy lease-less tokens when the viewer_leases table is missing', async () => {
+    await seedChannels();
+    const headers = { 'CF-Connecting-IP': '203.0.113.55', 'User-Agent': 'Old-IPTV/1.0' };
+
+    // A token minted before the lease table disappeared still plays: lease
+    // freshness must fail open, never take down playback. (No upstream mock:
+    // whether the fetch is edge-cached or falls back to the error manifest,
+    // the request must not be rejected by the lease layer.)
+    const before = await (await SELF.fetch(`${BASE}/tv.m3u`, { headers })).text();
+    const beforeUrl = before.split('\n').find((line) => line.includes('/hls/'))!;
+
+    try {
+      await env.DB.prepare('DROP TABLE viewer_leases').run();
+
+      // The playlist still builds: channel tokens simply carry no lease claim.
+      const res = await SELF.fetch(`${BASE}/tv.m3u`, { headers });
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      const tokenUrl = body.split('\n').find((line) => line.includes('/hls/'))!;
+      const token = tokenUrl.match(/\/hls\/([^.]+)\.m3u8$/)![1]!;
+      const verdict = await verifyToken(env.SECRET_KEY, token);
+      expect(verdict.ok).toBe(true);
+      if (verdict.ok) expect(verdict.payload.l).toBeUndefined();
+      expect((await SELF.fetch(tokenUrl, { headers })).status).toBe(200);
+
+      // An older lease-carrying token keeps playing too (fail-open heartbeat).
+      expect((await SELF.fetch(beforeUrl, { headers })).status).toBe(200);
+    } finally {
+      await env.DB.batch([
+        env.DB.prepare(
+          `CREATE TABLE IF NOT EXISTS viewer_leases (
+             identity_hash TEXT PRIMARY KEY,
+             lease_id      TEXT NOT NULL UNIQUE,
+             issued_at     INTEGER NOT NULL,
+             activated_at INTEGER,
+             last_seen     INTEGER NOT NULL DEFAULT 0,
+             updated_at    INTEGER NOT NULL
+           )`,
+        ),
+        env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_viewer_leases_seen ON viewer_leases(last_seen)'),
+        env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_viewer_leases_updated ON viewer_leases(updated_at)'),
+      ]);
+    }
+  });
+
   it('keeps custom-port channels opaque and never reveals their origin in a redirect', async () => {
     await seedChannels();
     const now = Math.floor(Date.now() / 1000);

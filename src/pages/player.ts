@@ -86,7 +86,7 @@ export function playerPage(): Response {
 const PLAYER_JS = String.raw`
 const $=s=>document.querySelector(s);
 const video=$('#video'),listEl=$('#list'),msgEl=$('#msg'),stateEl=$('#state'),titleEl=$('#title'),qualityEl=$('#quality'),groupEl=$('#group'),searchEl=$('#search'),countEl=$('#count');
-let channels=[],hls=null,dash=null,current=null,retries=0;
+let channels=[],hls=null,dash=null,current=null,retries=0,recoveryAttempts=0;
 
 const qs=new URLSearchParams(location.search);
 const auth=()=>{const p=new URLSearchParams();const key=sessionStorage.getItem('chrtv_key')||qs.get('key');const mac=sessionStorage.getItem('chrtv_mac')||qs.get('mac');if(key){p.set('key',key);if(mac)p.set('mac',mac)}return p.toString()};
@@ -108,7 +108,7 @@ function destroy(){
 }
 
 function play(src,title,meta){
-  current={src,title,meta:meta||{}};titleEl.textContent=title;retries=0;destroy();setMsg('Đang kết nối…');setState('');
+  current={src,title,meta:meta||{},id:(meta&&meta.id)||null};titleEl.textContent=title;retries=0;destroy();setMsg('Đang kết nối…');setState('');
   qualityEl.innerHTML='<option value="-1">Tự động</option>';
   const isDash=/\.mpd(\?|$)/i.test(src)||(meta&&meta.kind==='mpd');
   if(isDash&&window.dashjs&&dashjs.MediaPlayer){
@@ -117,8 +117,11 @@ function play(src,title,meta){
     if(meta&&meta.clearkey&&meta.clearkey.kid&&meta.clearkey.key){
       dash.setProtectionData({'org.w3.clearkey':{clearkeys:{[hexToB64Url(meta.clearkey.kid)]:hexToB64Url(meta.clearkey.key)}}});
     }
-    dash.on(dashjs.MediaPlayer.events.PLAYBACK_STARTED,()=>{setMsg('');setState('Đang phát ● (DASH)','ok')});
-    dash.on(dashjs.MediaPlayer.events.ERROR,()=>{setMsg('');setState('Không phát được — kênh DASH lỗi hoặc thiếu ClearKey','err')});
+    dash.on(dashjs.MediaPlayer.events.PLAYBACK_STARTED,()=>{recoveryAttempts=0;setMsg('');setState('Đang phát ● (DASH)','ok')});
+    dash.on(dashjs.MediaPlayer.events.ERROR,()=>{
+      if(current.id&&recoveryAttempts<2){recoveryAttempts++;setMsg('Link kênh hết hạn, đang cấp link mới…');setTimeout(recover,0);return}
+      setMsg('');setState('Không phát được — kênh DASH lỗi hoặc thiếu ClearKey','err');
+    });
     dash.initialize(video,src,true);
     return;
   }
@@ -127,12 +130,20 @@ function play(src,title,meta){
     hls=new Hls({enableWorker:true,liveSyncDurationCount:3,
       manifestLoadingTimeOut:30000,levelLoadingTimeOut:30000,fragLoadingTimeOut:30000,
       manifestLoadingMaxRetry:3,levelLoadingMaxRetry:4,fragLoadingMaxRetry:6});
-    hls.on(Hls.Events.MANIFEST_PARSED,()=>{setMsg('');setState('Đang phát ●','ok');video.play().catch(()=>{})});
+    hls.on(Hls.Events.MANIFEST_PARSED,()=>{recoveryAttempts=0;setMsg('');setState('Đang phát ●','ok');video.play().catch(()=>{})});
     hls.on(Hls.Events.LEVEL_SWITCHED,(e,d)=>{const auto=qualityEl.value==='-1';const idx=auto?d.level:Number(qualityEl.value);const l=hls.levels[idx];if(l)setState((auto?'Tự động · ':'')+(l.height?l.height+'p':Math.round((l.bitrate||0)/1000)+'kbps'),'ok')});
     hls.on(Hls.Events.ERROR,(e,d)=>{
       if(!d.fatal){return}
+      // The server explicitly rejected the token (410) or the identity (403):
+      // retrying the same URL cannot help — re-mint the channel link instead.
+      const code=d.response&&d.response.code;
+      if(code===410||code===403){
+        if(current.id&&recoveryAttempts<2){recoveryAttempts++;setMsg('Link kênh hết hạn, đang cấp link mới…');setTimeout(recover,0);return}
+        setMsg('');setState('Không phát được — link kênh hết hạn, hãy bấm Tải lại','err');return
+      }
       if(d.type===Hls.ErrorTypes.NETWORK_ERROR&&retries<3){retries++;setMsg('Mất kết nối, thử lại lần '+retries+'…');setTimeout(()=>hls&&hls.startLoad(),1500);return}
       if(d.type===Hls.ErrorTypes.MEDIA_ERROR&&retries<3){retries++;setMsg('Lỗi giải mã, khôi phục…');hls.recoverMediaError();return}
+      if(current.id&&recoveryAttempts<2){recoveryAttempts++;setMsg('Link kênh hết hạn, đang cấp link mới…');setTimeout(recover,0);return}
       setMsg('');setState('Không phát được — kênh có thể offline hoặc link token hết hạn','err');
     });
     hls.loadSource(src);hls.attachMedia(video);
@@ -148,7 +159,25 @@ function play(src,title,meta){
   }
 }
 qualityEl.onchange=()=>{if(hls)hls.currentLevel=Number(qualityEl.value)};
-$('#retry').onclick=()=>{if(current)play(current.src,current.title,current.meta)};
+
+// A token URL can die legitimately (rolling list generation rotated after the
+// viewer was idle). Re-mint the channel list and swap in the fresh URL instead
+// of failing forever on the stale one.
+async function recover(){
+  try{
+    const a=auth();const res=await fetch('/api/channels'+(a?'?'+a:''),{headers:{'Accept':'application/json'}});
+    const body=await res.json();
+    if(!res.ok)throw new Error(body.error||('HTTP '+res.status));
+    channels=body.channels||[];
+    const ch=channels.find(c=>c.id===current.id);
+    if(!ch)throw new Error('channel missing');
+    render();
+    play(ch.url,ch.name,{kind:ch.kind,clearkey:ch.clearkey,id:ch.id});
+  }catch(e){
+    setMsg('');setState('Không phát được — kênh có thể offline hoặc link token hết hạn','err');
+  }
+}
+$('#retry').onclick=()=>{if(!current)return;if(current.id){recoveryAttempts=0;recover()}else play(current.src,current.title,current.meta)};
 $('#fs').onclick=()=>{if(document.fullscreenElement)document.exitFullscreen();else$('.stage').requestFullscreen&&$('.stage').requestFullscreen()};
 $('#copy-src').onclick=async()=>{if(!current)return;await navigator.clipboard.writeText(new URL(current.src,location.origin).toString());setState('Da copy link','ok')};
 
@@ -160,7 +189,7 @@ function render(){
     const b=document.createElement('button');b.type='button';b.className='ch'+(current&&current.src===c.url?' active':'');
     if(c.logo){const img=document.createElement('img');img.src=c.logo;img.loading='lazy';img.alt='';img.onerror=()=>{img.replaceWith(noImg())};b.append(img)}else b.append(noImg());
     const nm=document.createElement('span');nm.className='nm';nm.textContent=c.name;const gp=document.createElement('span');gp.className='gp';gp.textContent=c.group;nm.prepend(gp);b.append(nm);
-    b.onclick=()=>{play(c.url,c.name,{kind:c.kind,clearkey:c.clearkey});history.replaceState(null,'','/xem?ch='+encodeURIComponent(c.id))};
+    b.onclick=()=>{play(c.url,c.name,{kind:c.kind,clearkey:c.clearkey,id:c.id});history.replaceState(null,'','/xem?ch='+encodeURIComponent(c.id))};
     listEl.append(b);
   }
   countEl.textContent=items.length+' / '+channels.length+' kenh';
@@ -179,7 +208,7 @@ async function load(){
     render();
     const ch=new URLSearchParams(location.search).get('ch');
     const pre=ch?channels.find(c=>c.id===ch):null;
-    if(pre)play(pre.url,pre.name,{kind:pre.kind,clearkey:pre.clearkey});
+    if(pre)play(pre.url,pre.name,{kind:pre.kind,clearkey:pre.clearkey,id:pre.id});
   }catch(e){countEl.textContent='Khong tai duoc kenh';setState('Loi: '+e.message+' — can ?key= neu playlist dang khoa','err')}
 }
 
