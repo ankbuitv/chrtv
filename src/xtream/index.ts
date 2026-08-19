@@ -317,7 +317,7 @@ export async function handleGetPhp(req: Request, env: Env, requestId: string): P
     },
     env.TOKEN_BINDING,
   );
-  const body = await buildPlaylist(env, url.origin, binding, auth.value.expires_at);
+  const body = await buildPlaylist(env, url.origin, binding, auth.value.expires_at, req);
   return playlistResponse(body, requestId, req.method === 'HEAD');
 }
 

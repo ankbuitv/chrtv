@@ -73,6 +73,6 @@ export async function handlePrivateLogin(req: Request, env: Env, requestId: stri
   });
   const url = new URL(req.url);
   const binding = requestTokenBinding(req, { userId: auth.value.id }, env.TOKEN_BINDING);
-  const body = await buildPlaylist(env, url.origin, binding, auth.value.expires_at);
+  const body = await buildPlaylist(env, url.origin, binding, auth.value.expires_at, req);
   return privateHeaders(playlistResponse(body, requestId, req.method === 'HEAD'));
 }

@@ -55,7 +55,7 @@ export async function handleChannelsApi(req: Request, env: Env, requestId: strin
   if (!access.ok) return access.response;
   const { binding, playlistExpiry, userId, username } = access.access;
 
-  const { entries, epgUrl } = await buildChannelEntries(env, new URL(req.url).origin, binding, playlistExpiry);
+  const { entries, epgUrl } = await buildChannelEntries(env, new URL(req.url).origin, binding, playlistExpiry, req);
 
   await recordAuthEvent(req, env, {
     userId,

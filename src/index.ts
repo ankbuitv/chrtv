@@ -73,7 +73,7 @@ async function handlePlaylistRoute(req: Request, env: Env, requestId: string): P
   const { binding, playlistExpiry, userId, username } = access.access;
 
   const url = new URL(req.url);
-  const body = await buildPlaylist(env, url.origin, binding, playlistExpiry);
+  const body = await buildPlaylist(env, url.origin, binding, playlistExpiry, req);
   await recordAuthEvent(req, env, {
     userId,
     username,
@@ -207,6 +207,7 @@ async function cleanup(env: Env): Promise<void> {
     env.DB.prepare('DELETE FROM auth_events WHERE created_at < ?').bind(now - 30 * 24 * 3600),
     env.DB.prepare("UPDATE user_sessions SET status = 'expired' WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at <= ?").bind(now),
     env.DB.prepare("DELETE FROM user_sessions WHERE status != 'active' AND last_seen < ?").bind(now - 90 * 24 * 3600),
+    env.DB.prepare('DELETE FROM viewer_leases WHERE updated_at < ?').bind(now - 30 * 24 * 3600),
     // Drop health rows for channels that have since been deactivated/removed.
     env.DB.prepare('DELETE FROM channel_health WHERE channel_id IN (SELECT id FROM channels WHERE active = 0)'),
   ]);

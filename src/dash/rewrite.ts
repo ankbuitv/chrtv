@@ -37,6 +37,7 @@ export interface DashRewriteOptions {
   publicOrigin: string;
   binding?: TokenBinding;
   channelId?: string;
+  leaseId?: string;
   absoluteExpiry?: number;
   now?: number;
   rf?: string;
@@ -50,6 +51,7 @@ function mintOpts(opts: DashRewriteOptions): MintOptions {
     publicOrigin: opts.publicOrigin,
     binding: opts.binding,
     ...(opts.channelId ? { channelId: opts.channelId } : {}),
+    ...(opts.leaseId ? { leaseId: opts.leaseId } : {}),
     ...(opts.absoluteExpiry !== undefined ? { absoluteExpiry: opts.absoluteExpiry } : {}),
     ...(opts.now !== undefined ? { now: opts.now } : {}),
     ...(opts.rf ? { rf: opts.rf } : {}),
