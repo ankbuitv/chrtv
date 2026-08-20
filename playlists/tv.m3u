@@ -1,6 +1,13 @@
 #EXTM3U url-tvg="https://epg.io.vn/epgc.xml"
 #EXTM3U x-tvg-url="https://vnepg.site/epgu.xml, "https://lichphatsong.site/schedule/epg.xml" tvg-shift=0 cache=500 deinterlace=1 aspect-ratio=16:9 m3uautoload=1"
 
+# ==========================================
+# 📺 EVENT OTT
+# Cập nhật ngày: 06/01
+# ==========================================
+
+#EXTINF:-1 tvg-id="event-01" tvg-logo="https://i.ibb.co/HDmcxzMK/Gemini-Generated-Image-v7i9yav7i9yav7i9-removebg-preview.png" group-title="EV - EVENT",Event 01
+https://clearance-pub-ram-chorus.trycloudflare.com/live/event1/index.m3u8
 
 # ==========================================
 # 📺 DANH SÁCH KÊNH TRUYỀN HÌNH VIỆT NAM
