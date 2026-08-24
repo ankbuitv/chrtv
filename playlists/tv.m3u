@@ -332,7 +332,7 @@ https://sg001-cdw18826playnow.ankb.qzz.io/NotForCommercial/api/stream/GETnfcplay
 https://sg001-cdw18826playnow.ankb.qzz.io/NotForCommercial/api/stream/GETnfcplay/aGJvX3ZpZXRuYW0/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
 
 #EXTINF:-1 tvg-id="hbovn" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/d/de/HBO_logo.svg/1024px-HBO_logo.svg.png" group-title="🎬 BOX - Giải trí",HBO Việt Nam
-🎬 BOX - Giải trí
+https://hbo.ankb.qzz.io/index.m3u8
 
 #EXTINF:-1 tvg-id="axn" tvg-logo="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTZ9ZkdwiuXS_zv7unMJpNdYB2QIJAZwAuyZW7uchKC9w&s" group-title="🎬 BOX - Giải trí",AXN
 https://sg001-cdw18826playnow.ankb.qzz.io/ph/api/stream/GETphplay/YXhu/index.m3u8?token=snYheZmfoT3BDCfcS8k4FNfCJbel4iveQYtx7ZMH
